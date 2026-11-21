@@ -7,6 +7,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.distributed.device_communicators import cuda_wrapper
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache import memory_pool_host
 from sglang.srt.mem_cache.memory_pool_host import (
@@ -75,6 +76,29 @@ class TestHiCacheHostRegister(unittest.TestCase):
             mock.patch.object(host_common, "_is_hip", True),
             mock.patch.dict(os.environ, {"HSA_USERPTR_FOR_PAGED_MEM": "0"}),
         )
+
+    def test_hip_runtime_reuses_loaded_dtk_library(self):
+        path = "/opt/dtk/hip/lib/libgalaxyhip.so.5"
+        library = mock.Mock()
+
+        def open_loaded_library(name, mode):
+            if name != path or mode != os.RTLD_NOLOAD:
+                raise OSError(name)
+            return library
+
+        host_common._hip_runtime.cache_clear()
+        self.addCleanup(host_common._hip_runtime.cache_clear)
+        with (
+            mock.patch.object(
+                cuda_wrapper,
+                "find_loaded_library",
+                side_effect={"libgalaxyhip": path}.get,
+            ),
+            mock.patch.object(
+                cuda_wrapper.ctypes, "CDLL", side_effect=open_loaded_library
+            ),
+        ):
+            self.assertIs(host_common._hip_runtime(), library)
 
     def test_hip_non_userptr_pool_is_exact_size_and_never_unregistered(self):
         """The pool must not be rounded up to a power of two (torch pin_memory pins
