@@ -176,6 +176,33 @@ class TestInterleaveCpGatherMemory(CustomTestCase):
             with self.subTest(**kwargs):
                 self.assertEqual(len(self._gather(legacy=True, **kwargs)), 1)
 
+    def test_legacy_cp8_adaptive_output_preserves_token_order(self):
+        cp_size, rows = 8, 1032
+        # This layout has a 515-row cycle and triggers both copy paths.
+        for width, in_place in ((512, False), (5120, True)):
+            with self.subTest(width=width):
+                row_values = torch.arange(rows, dtype=torch.int16)[:, None]
+                column_values = torch.arange(width, dtype=torch.int16)[None, :]
+                expected = row_values ^ column_values
+                gathered = (
+                    expected.view(rows // cp_size, cp_size, width)
+                    .transpose(0, 1)
+                    .contiguous()
+                    .view(rows, width)
+                )
+                with mock.patch.object(
+                    hcu_cp_utils, "_use_inplace_cp_output", return_value=True
+                ):
+                    result = hcu_cp_utils._interleave_cp_output(gathered, cp_size)
+                self.assertTrue(torch.equal(result, expected))
+                self.assertEqual(result.data_ptr() == gathered.data_ptr(), in_place)
+
+    def test_cp8_cycle_threshold_includes_the_boundary(self):
+        has_long_cycle = hcu_cp_utils._cp_interleave_has_long_cycle
+        self.assertTrue(has_long_cycle(32608, 8, 3622))
+        self.assertFalse(has_long_cycle(32608, 8, 3623))
+        self.assertFalse(has_long_cycle(32768, 8, 256))
+
 
 if __name__ == "__main__":
     unittest.main()
