@@ -18,6 +18,7 @@ class TestInt8KernelBridge(unittest.TestCase):
     def tearDown(self):
         for function in [dsv41_int8.backend, dsv41_int8._service_config, dsv41_int8._algorithms, dsv41_int8._scale_schedules]:
             function.cache_clear()
+        dsv41_int8._algo_rank_cache.clear()
 
     def test_backend_lazily_binds_installed_kernel_once(self):
         ops = types.SimpleNamespace(**{name: Mock() for name in dsv41_int8._OPERATORS})
@@ -69,6 +70,82 @@ class TestInt8KernelBridge(unittest.TestCase):
         with patch("builtins.__import__", side_effect=guarded):
             spec.loader.exec_module(module)
         self.assertEqual(module.backend.cache_info().currsize, 0)
+
+    def test_autotune_selects_fastest_rank_caches_and_stops_on_exhaustion(self):
+        latencies = {0: 5.0, 1: 1.2, 2: 2.5}
+        calls = []
+
+        def fake_gemm_out(q, w, raw, groups, tile_n, group_major, algo_rank=0):
+            calls.append(algo_rank)
+            if algo_rank not in latencies:
+                raise RuntimeError("invalid heuristic rank")
+
+        class FakeEvent:
+            last_rank = 0
+
+            def __init__(self, enable_timing=False):
+                self.rank = 0
+
+            def record(self):
+                self.rank = calls[-1] if calls else 0
+
+            def synchronize(self):
+                pass
+
+            def elapsed_time(self, other):
+                return latencies[other.rank]
+
+        ops = types.SimpleNamespace(gemm_out=fake_gemm_out)
+        fake_q = types.SimpleNamespace(
+            shape=(4096, 8, 4096),
+            is_cuda=True,
+            device=types.SimpleNamespace(index=0),
+        )
+        with (
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            patch.object(torch.cuda, "Event", FakeEvent),
+        ):
+            best = dsv41_int8._select_unpacked_algo_rank(
+                ops, fake_q, object(), object(), 8, 1024, 4096, 0, False
+            )
+            self.assertEqual(best, 1)
+            probe_calls = len(calls)
+            # Second call hits cache with zero extra probes.
+            best_cached = dsv41_int8._select_unpacked_algo_rank(
+                ops, fake_q, object(), object(), 8, 1024, 4096, 0, False
+            )
+            self.assertEqual(best_cached, 1)
+            self.assertEqual(len(calls), probe_calls)
+
+    def test_autotune_skipped_during_graph_capture_without_poisoning_cache(self):
+        ops = types.SimpleNamespace(gemm_out=Mock())
+        fake_q = types.SimpleNamespace(
+            shape=(6, 8, 4096),
+            is_cuda=True,
+            device=types.SimpleNamespace(index=0),
+        )
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            rank = dsv41_int8._select_unpacked_algo_rank(
+                ops, fake_q, object(), object(), 8, 1024, 4096, 0, False
+            )
+        self.assertEqual(rank, 0)
+        self.assertEqual(len(dsv41_int8._algo_rank_cache), 0)
+        ops.gemm_out.assert_not_called()
+
+    def test_autotune_respects_disable_env_and_explicit_rank(self):
+        with patch.dict(os.environ, {"SGLANG_DSV41_INT8_BLASLT_AUTOTUNE": "0"}):
+            self.assertFalse(dsv41_int8._blaslt_autotune_enabled())
+        with patch.dict(os.environ, {"SGLANG_DSV41_INT8_BLASLT_AUTOTUNE": "1"}):
+            self.assertTrue(dsv41_int8._blaslt_autotune_enabled())
+
+    def test_autotune_buckets_large_prefill_t_but_keeps_small_decode_exact(self):
+        self.assertEqual(dsv41_int8._autotune_t_bucket(6), 6)
+        self.assertEqual(dsv41_int8._autotune_t_bucket(48), 48)
+        self.assertEqual(dsv41_int8._autotune_t_bucket(64), 64)
+        self.assertEqual(dsv41_int8._autotune_t_bucket(65), 128)
+        self.assertEqual(dsv41_int8._autotune_t_bucket(3652), 4096)
+        self.assertEqual(dsv41_int8._autotune_t_bucket(3653), 4096)
+        self.assertEqual(dsv41_int8._autotune_t_bucket(4096), 4096)
 
 if __name__ == "__main__":
     unittest.main()

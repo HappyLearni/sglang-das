@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import weakref
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 
@@ -84,6 +85,9 @@ _lock = threading.RLock()
 _packs = {}
 _plans = {}
 _scale_seen = set()
+_algo_rank_cache: OrderedDict = OrderedDict()
+_ALGO_RANK_CACHE_MAX_ENTRIES = 4096
+_TRITON_SCALE_MIN_ELEMENTS = 4_194_304
 
 _DEFAULT_SERVICE_CONFIG = {'algorithms': {'wo_a:1:4096:8:8192:1024:0': '9d220000000000000000000000000000',
                 'wo_a:5:4096:8:8192:1024:0': '9d220000000000000000000000000000',
@@ -221,6 +225,35 @@ def _scale_int32(ACC, XS, WS, Y, T:tl.constexpr, G:tl.constexpr,
 
 
 @triton.jit
+def _scale_int32_dynamic(
+    ACC,
+    XS,
+    WS,
+    Y,
+    T,
+    TOTAL,
+    G: tl.constexpr,
+    R: tl.constexpr,
+    GROUP_MAJOR: tl.constexpr,
+    B: tl.constexpr,
+):
+    j = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B).to(tl.int64)
+    valid = j < TOTAL
+    row = j // R
+    group = row % G
+    token = row // G
+    col = j % R
+    if GROUP_MAJOR:
+        raw = (group * T + token) * R + col
+    else:
+        raw = j
+    acc = tl.load(ACC + raw, valid, other=0).to(tl.float32)
+    xs = tl.load(XS + row, valid, other=0)
+    ws = tl.load(WS + group * R + col, valid, other=0)
+    tl.store(Y + j, acc * xs * ws, valid)
+
+
+@triton.jit
 def _scale_grid(ACC,XS,WS,Y,M:tl.constexpr,N:tl.constexpr,WIDTH:tl.constexpr,BLOCK:tl.constexpr):
  local=tl.program_id(0)*BLOCK+tl.arange(0,BLOCK);row=tl.program_id(1);group=tl.program_id(2);col=group*WIDTH+local;valid=local<WIDTH
  a=tl.load(ACC+(group*M+row)*WIDTH+local,valid,0).to(tl.float32);xs=tl.load(XS+row);ws=tl.load(WS+col,valid,0);tl.store(Y+row*N+col,(a*xs)*ws,valid)
@@ -243,6 +276,80 @@ def _algorithm_config(path):
         return json.load(f)["algorithms"]
 
 
+def _blaslt_autotune_enabled() -> bool:
+    raw = os.environ.get("SGLANG_DSV41_INT8_BLASLT_AUTOTUNE")
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return torch.version.hip is not None
+
+
+def _autotune_t_bucket(t: int) -> int:
+    # Keep exact M for small decode/graph-captured batches (<= 64) and bucket
+    # larger variable-length prefill chunks by next power of two so arbitrary
+    # chunk lengths reuse a handful of cached hipBLASLt heuristic ranks.
+    return t if t <= 64 else 1 << (t - 1).bit_length()
+
+
+def _select_unpacked_algo_rank(ops, q, w, raw, groups, rank, k, tile_n, group_major):
+    t = q.shape[1] if group_major else q.shape[0]
+    t_bucket = _autotune_t_bucket(t)
+    cache_key = (q.device.index, t_bucket, groups, rank, k, tile_n, bool(group_major))
+    cached = _algo_rank_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    if not q.is_cuda or torch.cuda.is_current_stream_capturing():
+        return 0
+    with _lock:
+        cached = _algo_rank_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if torch.cuda.is_current_stream_capturing():
+            return 0
+        max_ranks = max(
+            1, int(os.environ.get("SGLANG_DSV41_INT8_BLASLT_AUTOTUNE_MAX_RANKS", "32"))
+        )
+        best_rank = 0
+        best_ms = float("inf")
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        iters = 2
+        for cand in range(max_ranks):
+            try:
+                ops.gemm_out(q, w, raw, groups, tile_n, group_major, cand)
+            except RuntimeError:
+                if cand == 0:
+                    raise
+                break
+            if cand == 0:
+                ops.gemm_out(q, w, raw, groups, tile_n, group_major, cand)
+                start.record()
+                ops.gemm_out(q, w, raw, groups, tile_n, group_major, cand)
+                end.record()
+                end.synchronize()
+                probe_ms = start.elapsed_time(end)
+                if probe_ms < 0.3:
+                    iters = 10
+                elif probe_ms < 2.0:
+                    iters = 5
+                else:
+                    iters = 2
+            else:
+                ops.gemm_out(q, w, raw, groups, tile_n, group_major, cand)
+            start.record()
+            for _ in range(iters):
+                ops.gemm_out(q, w, raw, groups, tile_n, group_major, cand)
+            end.record()
+            end.synchronize()
+            elapsed = start.elapsed_time(end) / iters
+            if elapsed < best_ms:
+                best_ms = elapsed
+                best_rank = cand
+        _algo_rank_cache[cache_key] = best_rank
+        if len(_algo_rank_cache) > _ALGO_RANK_CACHE_MAX_ENTRIES:
+            _algo_rank_cache.popitem(last=False)
+        return best_rank
+
+
 def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, group_major=False, algo_rank=None):
     if (
         x.ndim != 3 or x.shape[1] != groups or groups <= 0 or rank <= 0
@@ -262,10 +369,17 @@ def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, 
         raise ValueError("INT8 BLASLt tile size must be non-negative")
     ops = load_native()
     t = x.shape[0]
+    k = x.shape[-1]
+    use_autotune = False
     if algo_rank is None:
         config = os.environ.get("SGLANG_DSV41_INT8_BLASLT_ALGO_CONFIG")
-        key = f"{t}:{groups}:{rank}:{x.shape[-1]}:{tile_n}:{int(group_major)}"
-        algo_rank = int(_algorithm_config(config).get(key, 0)) if config else 0
+        if config:
+            key = f"{t}:{groups}:{rank}:{k}:{tile_n}:{int(group_major)}"
+            algo_rank = int(_algorithm_config(config).get(key, 0))
+        elif _blaslt_autotune_enabled():
+            use_autotune = True
+        else:
+            algo_rank = 0
     y = torch.empty((t, groups, rank), device=x.device, dtype=output_dtype)
     if not t:
         return y
@@ -274,8 +388,26 @@ def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, 
         q = q.transpose(0, 1).contiguous()
     raw = torch.empty((groups, t, rank) if group_major else (t, groups, rank),
                       device=x.device, dtype=torch.int32)
-    ops.gemm_out(q, w, raw, groups, tile_n, group_major, algo_rank)
-    ops.scale_out(raw, xs, s, y, groups, group_major)
+    if use_autotune:
+        algo_rank = _select_unpacked_algo_rank(
+            ops, q, w, raw, groups, rank, k, tile_n, group_major
+        )
+    try:
+        ops.gemm_out(q, w, raw, groups, tile_n, group_major, algo_rank)
+    except RuntimeError:
+        if use_autotune and algo_rank != 0:
+            ops.gemm_out(q, w, raw, groups, tile_n, group_major, 0)
+        else:
+            raise
+    numel = t * groups * rank
+    if y.is_cuda and torch.version.hip is not None and numel >= _TRITON_SCALE_MIN_ELEMENTS:
+        sb = 2048
+        _scale_int32_dynamic[(triton.cdiv(numel, sb),)](
+            raw, xs, s, y, t, numel, groups, rank, bool(group_major), sb,
+            num_warps=8, enable_fp_fusion=False,
+        )
+    else:
+        ops.scale_out(raw, xs, s, y, groups, group_major)
     return y
 
 
