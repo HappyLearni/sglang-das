@@ -1,13 +1,21 @@
 from typing import Optional, Tuple
 
 import torch
-from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
-from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
-from aiter.tuned_gemm import tgemm
 
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+
+if _use_aiter:
+    from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
+    from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
+    from aiter.tuned_gemm import tgemm
+else:
+    fused_qk_rope_cat_and_cache_mla = None
+    fused_qk_rope_cat = None
+    tgemm = None
 
 __all__ = [
     "fused_fp8_bmm_rope_cat_and_cache_mla",
@@ -19,7 +27,7 @@ __all__ = [
 # bmm+rope+cache op is gfx95-only. Import it behind the same predicate its one
 # caller gates on, so an aiter build without the op cannot take down every
 # DeepSeek import on another card. The name stays bound either way.
-if is_gfx95_supported():
+if _use_aiter and is_gfx95_supported():
     from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
         fused_fp8_bmm_rope_cat_and_cache_mla,
     )
@@ -44,6 +52,13 @@ def rocm_dsv3_router_split_k(
     the buffer: it sums the partials into it inside the fused gate launch."""
     num_tokens = hidden_states.shape[0]
     if not 0 < num_tokens <= gate.rocm_router_max_tokens:
+        return None
+    if (
+        hidden_states.dtype != torch.bfloat16
+        or gate.weight.dtype != torch.bfloat16
+        or hidden_states.stride(1) != 1
+        or gate.weight.stride(1) != 1
+    ):
         return None
     if get_exec().deterministic.enable_deterministic_inference:
         return None

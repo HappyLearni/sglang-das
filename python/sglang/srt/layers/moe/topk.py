@@ -252,6 +252,7 @@ if _use_aiter:
         from aiter.fused_moe import fused_topk as aiter_fused_topk
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+if _use_aiter or _is_hcu:
     from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_reduce_partials
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gate
 if _is_musa:
@@ -1930,7 +1931,11 @@ def biased_topk_jit_kernel_impl(
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert num_shared_append == 0 or router_logits_partials is not None
 
-    if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
+    if (
+        (_use_aiter or (_is_hcu and router_logits_partials is not None))
+        and scoring_func == "sqrtsoftplus"
+        and num_fused_shared_experts == 0
+    ):
         assert packed_out is None, "aiter topk_gating cannot emit packed ids"
         if router_logits_partials is not None:
             # ROCm decode router: split-K reduce + gate in one launch
@@ -3344,19 +3349,40 @@ def select_experts(
     )
 
     if router_logits_partials is not None and not (
-        _use_aiter
+        (_use_aiter or _is_hcu)
         and scoring_func == "sqrtsoftplus"
         and custom_routing_function is None
         and not use_grouped_topk
         and not torch_native
         and expert_location_dispatch_info is None
         and (
+            _use_aiter
+            or (
+                not apply_routed_scaling_factor_on_output
+                and not (
+                    topk_config.sqrtsoftplus_log1p
+                    and _can_use_lightop_deepep_topk_fusion(
+                        router_logits,
+                        top_k,
+                        num_fused_shared_experts,
+                        routing_overridden,
+                        expert_location_dispatch_info,
+                    )
+                )
+            )
+        )
+        and (
             num_fused_shared_experts == 0
-            or has_per_rank_fused_shared_slots(num_fused_shared_experts)
-            or not is_expert_remapping_enabled()
+            or (
+                _use_aiter
+                and (
+                    has_per_rank_fused_shared_slots(num_fused_shared_experts)
+                    or not is_expert_remapping_enabled()
+                )
+            )
         )
     ):
-        # only the aiter sqrtsoftplus gate takes the partials; every other route reads router_logits
+        # only the ROCm sqrtsoftplus gate takes the partials; every other route reads router_logits
         rocm_router_reduce_partials(router_logits_partials, router_logits)
         router_logits_partials = None
 
@@ -3501,6 +3527,7 @@ def select_experts(
             use_lightop_gate = (
                 scoring_func == "sqrtsoftplus"
                 and "packed_out" not in _packed_kwargs
+                and router_logits_partials is None
                 and _can_use_lightop_sqrtsoftplus_gate(
                     router_logits,
                     correction_bias,
@@ -3554,7 +3581,7 @@ def select_experts(
                     **_packed_kwargs,
                 )
                 if (
-                    use_lightop_gate
+                    (use_lightop_gate or (_is_hcu and router_logits_partials is not None))
                     and topk_config.sqrtsoftplus_log1p
                     and get_moe_a2a_backend().is_deepep()
                     and not _skip_hip_pad_mask

@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hcu, is_hip
 
 # the GEMV walks 16-row tiles inside one program, so every M runs the same tile (batch invariance)
 ROCM_ROUTER_MAX_TOKENS = 64
@@ -19,11 +19,24 @@ _BLOCK_K = 512
 _MAX_SPLIT_K = 32
 
 
-def rocm_gemv_split_k_max_tokens(*, n: int, k: int, weight_dtype: torch.dtype) -> int:
+def _hcu_router_split_k_enabled() -> bool:
+    return is_hcu() and get_bool_env_var("SGLANG_HCU_ROCM_ROUTER_SPLIT_K", "true")
+
+
+def rocm_gemv_split_k_max_tokens(
+    *,
+    n: int,
+    k: int,
+    weight_dtype: torch.dtype,
+    allow_hcu: bool = False,
+) -> int:
     """Rows up to which rocm_router_gemv_split_k serves an [M, k] @ [n, k].T bf16
     GEMV (one 16-wide N tile per 512 of K, 16-row tiles), -1 when the device or the shape
     rules it out."""
-    if not (is_hip() and is_gfx95_supported()):
+    if not (
+        is_hip()
+        and (is_gfx95_supported() or (allow_hcu and _hcu_router_split_k_enabled()))
+    ):
         return -1
     if weight_dtype != torch.bfloat16:
         return -1
