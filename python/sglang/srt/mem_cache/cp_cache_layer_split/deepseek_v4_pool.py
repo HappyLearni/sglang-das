@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 _USE_STATIC_CP_LAYER_SPLIT_PAGES = is_hcu() and get_bool_env_var(
     "SGLANG_HCU_OPT_LAYERSPLIT_STATIC_PAGES", default="true"
 )
+_DEDUP_REPLICATED_INDEXER_PD = get_bool_env_var(
+    "SGLANG_CP_LAYER_SPLIT_DEDUP_INDEXER_PD", default="true"
+)
 
 @dataclass
 class _BatchActivePages:
@@ -176,6 +179,105 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         # non-owner these must come from the prefetched, compact staging pool.
         return self.get_index_k_with_scale_buffer(layer_id)
 
+    def _replicated_indexer_transfer_owners(self) -> dict[tuple[int, int], int]:
+        """Assign each replicated ratio-1/2 indexer to one CP rank for PD transfer.
+
+        Compressed KV buffers (c1_kv/c2_kv) are owned by the CP rank hosting each
+        source layer, which leaves non-owning ranks idle on compressed-KV transfer.
+        Greedily placing each replicated indexer on the least-loaded CP rank
+        eliminates (cp_size - 1)x redundant RDMA writes and balances NIC traffic.
+        """
+        loads = [0.0] * self.cp_size
+        for ratio in (1, 2):
+            kv_weight = 2.0 / ratio
+            for source in self.sources_by_ratio.get(ratio, ()):
+                owner = self._get_layer_owner_rank(source)
+                loads[owner] += kv_weight
+
+        owners: dict[tuple[int, int], int] = {}
+        for ratio in (1, 2):
+            if self.index_pools.get(ratio) is None:
+                continue
+            indexer_weight = 0.25 / ratio
+            for source in self.sources_by_ratio.get(ratio, ()):
+                owner = min(range(self.cp_size), key=lambda rank: (loads[rank], rank))
+                owners[(ratio, source)] = owner
+                loads[owner] += indexer_weight
+        return owners
+
+    def _owns_replicated_indexer_transfer(self, ratio: int, source: int) -> bool:
+        if not _DEDUP_REPLICATED_INDEXER_PD:
+            return True
+        owners = getattr(self, "_replicated_indexer_pd_owners", None)
+        if owners is None:
+            owners = self._replicated_indexer_transfer_owners()
+            self._replicated_indexer_pd_owners = owners
+        return owners.get((ratio, source)) == self.cp_rank
+
+    def get_contiguous_buf_infos(self) -> tuple[list[int], list[int], list[int]]:
+        """Contiguous page buffers parallel to ``get_kv_transfer_layout``."""
+        if self._unified_kv or not _DEDUP_REPLICATED_INDEXER_PD:
+            return super().get_contiguous_buf_infos()
+
+        data_ptrs: list[int] = []
+        data_lens: list[int] = []
+        item_lens: list[int] = []
+
+        def append_page_buffer(buf: torch.Tensor, scale: int = 1) -> None:
+            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+            data_ptrs.append(buf.data_ptr())
+            data_lens.append(buf.nbytes)
+            item_lens.append(buf[0].nbytes * scale)
+
+        for ratio, kv_pool in self.kv_pools.items():
+            if kv_pool is not None:
+                for buf in kv_pool.kv_buffer:
+                    append_page_buffer(buf)
+
+            indexer_pool = self.index_pools.get(ratio)
+            if indexer_pool is None:
+                continue
+            index_pages_per_full_page = 1
+            if ratio in (1, 2):
+                slots_per_full_page = self.page_size // ratio
+                assert slots_per_full_page % indexer_pool.page_size == 0, (
+                    f"ratio-{ratio} index pages of {indexer_pool.page_size} slots do not "
+                    f"tile a FULL page of {slots_per_full_page} slots"
+                )
+                index_pages_per_full_page = (
+                    slots_per_full_page // indexer_pool.page_size
+                )
+                sources = self.sources_by_ratio.get(ratio, ())
+                owned_indices = [
+                    idx
+                    for idx, source in enumerate(sources)
+                    if self._owns_replicated_indexer_transfer(ratio, source)
+                ]
+                if indexer_pool.index_k_with_scale_buffer is not None:
+                    bufs = [
+                        indexer_pool.index_k_with_scale_buffer[idx]
+                        for idx in owned_indices
+                    ]
+                else:
+                    bufs = [
+                        indexer_pool.index_k_payload_buffer[idx]
+                        .view(torch.uint8)
+                        .flatten(1)
+                        for idx in owned_indices
+                    ] + [
+                        indexer_pool.index_k_scale_buffer[idx]
+                        .view(torch.uint8)
+                        .flatten(1)
+                        for idx in owned_indices
+                    ]
+            else:
+                bufs = indexer_pool.contiguous_page_row_buffers()
+
+            for buf in bufs:
+                append_page_buffer(buf, scale=index_pages_per_full_page)
+
+        return data_ptrs, data_lens, item_lens
+
     def get_kv_transfer_layout(self) -> list:
         """Descriptors parallel to this rank's sharded V4 KV buffer list."""
         layout: list = []
@@ -206,14 +308,22 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 for source in sources
                 if self._is_layer_owned(source)
             )
-            # FP4 indexer keys stay replicated so each CP rank can run local
-            # TopK. The PD sender may transfer identical keys from each rank.
+            # FP4 indexer keys stay replicated locally so each CP rank can run
+            # TopK, while PD transfers assign each source to one balanced rank.
             indexer_pool = self.index_pools.get(ratio)
             if indexer_pool is not None:
-                layout.extend((f"c{ratio}_indexer", source) for source in sources)
+                owned_sources = [
+                    source
+                    for source in sources
+                    if self._owns_replicated_indexer_transfer(ratio, source)
+                ]
+                layout.extend(
+                    (f"c{ratio}_indexer", source) for source in owned_sources
+                )
                 if indexer_pool.index_k_with_scale_buffer is None:
                     layout.extend(
-                        (f"c{ratio}_indexer_scale", source) for source in sources
+                        (f"c{ratio}_indexer_scale", source)
+                        for source in owned_sources
                     )
         return layout
 

@@ -321,6 +321,155 @@ class TestCpCacheLayerSplitDspark(CustomTestCase):
             for args, _ in peers:
                 self.assertEqual(disagg_utils.get_dsv41_spec_layout(args), expected)
 
+    def test_dedup_replicated_indexer_pd_assigns_each_source_once_and_balances_ranks(self):
+        import torch
+        from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
+            CpCacheLayerSplitDeepSeekV4TokenToKVPool,
+        )
+
+        def make_fake_pool(cp_rank: int, cp_size: int, *, separate_scale: bool):
+            pool = object.__new__(CpCacheLayerSplitDeepSeekV4TokenToKVPool)
+            pool._init_cp_cache_layer_split(
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                layer_shard_start_layer=0,
+                layer_shard_layer_num=40,
+            )
+            pool._stage_start = 0
+            pool._stage_end = 40
+            pool._unified_kv = False
+            pool.page_size = 256
+            pool.compression_ratios = [0, 0] + [2] * 18 + [1] * 20
+            pool.sources_by_ratio = {1: (20,), 2: (2, 8, 14)}
+            pool.kv_pools = {}
+            pool.index_pools = {}
+            for ratio in (1, 2):
+                owned_sources = [
+                    s for s in pool.sources_by_ratio[ratio] if pool._is_layer_owned(s)
+                ]
+                kv_bufs = [
+                    torch.zeros((4, 576 * (256 // ratio)), dtype=torch.uint8)
+                    for _ in owned_sources
+                ]
+                pool.kv_pools[ratio] = SimpleNamespace(kv_buffer=kv_bufs)
+                n_src = len(pool.sources_by_ratio[ratio])
+                if separate_scale:
+                    pool.index_pools[ratio] = SimpleNamespace(
+                        page_size=64,
+                        index_k_with_scale_buffer=None,
+                        index_k_payload_buffer=[
+                            torch.zeros((16, 64 * 64), dtype=torch.uint8)
+                            for _ in range(n_src)
+                        ],
+                        index_k_scale_buffer=[
+                            torch.zeros((16, 64 * 4), dtype=torch.uint8)
+                            for _ in range(n_src)
+                        ],
+                    )
+                else:
+                    pool.index_pools[ratio] = SimpleNamespace(
+                        page_size=64,
+                        index_k_with_scale_buffer=[
+                            torch.zeros((16, 64 * 68), dtype=torch.uint8)
+                            for _ in range(n_src)
+                        ],
+                    )
+            return pool
+
+        for cp_size in (2, 4, 8):
+            for separate_scale in (False, True):
+                with self.subTest(cp_size=cp_size, separate_scale=separate_scale):
+                    pools_list = [
+                        make_fake_pool(r, cp_size, separate_scale=separate_scale)
+                        for r in range(cp_size)
+                    ]
+                    seen = []
+                    per_rank_counts = []
+                    for pool in pools_list:
+                        layout = pool.get_kv_transfer_layout()
+                        ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
+                        self.assertEqual(len(layout), len(ptrs))
+                        self.assertEqual(len(layout), len(lens))
+                        self.assertEqual(len(layout), len(item_lens))
+                        seen.extend(layout)
+                        per_rank_counts.append(len(layout))
+
+                    # Union covers every KV and indexer buffer with zero duplicates.
+                    self.assertEqual(len(seen), len(set(seen)))
+                    expected_keys = {
+                        ("c1_kv", 20),
+                        ("c2_kv", 2),
+                        ("c2_kv", 8),
+                        ("c2_kv", 14),
+                        ("c1_indexer", 20),
+                        ("c2_indexer", 2),
+                        ("c2_indexer", 8),
+                        ("c2_indexer", 14),
+                    }
+                    if separate_scale:
+                        expected_keys |= {
+                            ("c1_indexer_scale", 20),
+                            ("c2_indexer_scale", 2),
+                            ("c2_indexer_scale", 8),
+                            ("c2_indexer_scale", 14),
+                        }
+                    self.assertEqual(set(seen), expected_keys)
+                    if cp_size == 8 and not separate_scale:
+                        # Every CP rank owns exactly 1 KV or indexer buffer.
+                        self.assertEqual(per_rank_counts, [1] * 8)
+                        self.assertEqual(
+                            pools_list[3].get_kv_transfer_layout(),
+                            [("c1_indexer", 20)],
+                        )
+                        self.assertEqual(
+                            pools_list[4].get_kv_transfer_layout(),
+                            [("c1_kv", 20)],
+                        )
+
+    def test_dedup_handshake_matches_unsharded_decode(self):
+        # Simulate deduplicated CP8 where each replicated indexer is only on one rank.
+        indexer_owner = {
+            ("c1_indexer", 20): 3,
+            ("c2_indexer", 2): 5,
+            ("c2_indexer", 8): 6,
+            ("c2_indexer", 14): 7,
+        }
+        peers = []
+        for rank in range(8):
+            args, entries = self._transfer_args(rank, request_window=True)
+            filtered_kv = [
+                (key, size)
+                for key, size in entries[0]
+                if key not in indexer_owner or indexer_owner[key] == rank
+            ]
+            args.kv_layer_ids = [key[1] for key, _ in filtered_kv]
+            args.kv_item_lens = [size for _, size in filtered_kv]
+            args.v4_transfer_metadata["kv"] = [key for key, _ in filtered_kv]
+            peers.append((args, [filtered_kv, *entries[1:]]))
+
+        gather = mock.Mock(return_value=[entries for _, entries in peers])
+        with (
+            mock.patch.object(
+                disagg_utils,
+                "get_spec",
+                return_value=SimpleNamespace(
+                    speculative_algorithm="DSPARK", speculative_num_draft_tokens=6
+                ),
+            ),
+            mock.patch.object(
+                disagg_utils,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    attn_cp_group=SimpleNamespace(all_gather_object=gather)
+                ),
+                create=True,
+            ),
+        ):
+            decode, _ = self._transfer_args(request_window=True)
+            expected = disagg_utils.get_dsv41_spec_layout(decode)
+            for args, _ in peers:
+                self.assertEqual(disagg_utils.get_dsv41_spec_layout(args), expected)
+
     def test_layer_split_handshake_matches_unsharded_decode(self):
         self._check_handshake(request_window=False)
 
