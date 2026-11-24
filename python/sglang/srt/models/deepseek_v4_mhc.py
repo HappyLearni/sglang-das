@@ -771,6 +771,23 @@ def _post_fusion(
             next.norm.variance_epsilon,
         )
         return HcState(updated, pre, HcNormed(normalized))
+    if _is_hcu and next is not None:
+        from sglang.kernels.ops.layernorm.mhc_hcu_post_combine_norm import (
+            can_use_hcu_mhc_post_combine_norm,
+            mhc_post_combine_norm_hcu,
+        )
+
+        if can_use_hcu_mhc_post_combine_norm(cfg, y, residual, next):
+            updated, normalized = mhc_post_combine_norm_hcu(
+                y,
+                residual,
+                post_mix,
+                comb,
+                pre,
+                next.norm.weight,
+                next.norm.variance_epsilon,
+            )
+            return HcState(updated, pre, HcNormed(normalized))
     return HcState(post(cfg, y, residual, post_mix, comb), pre)
 
 
