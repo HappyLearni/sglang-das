@@ -28,6 +28,14 @@ def test_triton_quantize_gate_and_block_r(monkeypatch):
     assert mod._can_use_triton_quantize(cpu_x) is False
 
 
+    # Below threshold (e.g. decode or small prefill) must stay on native C++.
+    if torch.cuda.is_available() and torch.version.hip is not None:
+        small_gpu = torch.empty((512, 8, 4096), dtype=torch.bfloat16, device="cuda")
+        big_gpu = torch.empty((1024, 8, 4096), dtype=torch.bfloat16, device="cuda")
+        assert mod._can_use_triton_quantize(small_gpu) is False
+        assert mod._can_use_triton_quantize(big_gpu) is True
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is None,
     reason="Requires HCU/ROCm GPU",
@@ -35,10 +43,9 @@ def test_triton_quantize_gate_and_block_r(monkeypatch):
 @pytest.mark.parametrize(
     "shape",
     [
-        (4096, 8, 512),
-        (4096, 16, 512),
+        (1024, 8, 4096),
         (4096, 8, 4096),
-        (65, 8, 512),  # non-multiple of BLOCK_R=8
+        (65, 8, 512),  # non-multiple of BLOCK_R=8 (direct kernel check)
         (131, 4, 768),  # non-power-of-2 K and non-multiple of BLOCK_R=4
     ],
 )
@@ -54,7 +61,12 @@ def test_triton_quantize_bitwise_exact_vs_native(shape, monkeypatch):
     q_ref, s_ref = mod.quantize(x)
 
     monkeypatch.setenv("SGLANG_DSV41_INT8_TRITON_QUANT", "1")
-    q_tri, s_tri = mod.quantize(x)
+    if x.numel() >= mod._TRITON_QUANT_MIN_ELEMENTS:
+        q_tri, s_tri = mod.quantize(x)
+    else:
+        q_tri = torch.empty_like(q_ref)
+        s_tri = torch.empty_like(s_ref)
+        mod._quantize_triton(x, q_tri, s_tri)
 
     assert torch.equal(q_tri, q_ref), (
         f"q mismatch for {shape}: max_diff={(q_tri.int() - q_ref.int()).abs().max().item()}"

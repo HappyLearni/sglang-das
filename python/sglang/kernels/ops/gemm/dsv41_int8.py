@@ -227,7 +227,10 @@ def _scale_grid(ACC,XS,WS,Y,M:tl.constexpr,N:tl.constexpr,WIDTH:tl.constexpr,BLO
  a=tl.load(ACC+(group*M+row)*WIDTH+local,valid,0).to(tl.float32);xs=tl.load(XS+row);ws=tl.load(WS+col,valid,0);tl.store(Y+row*N+col,(a*xs)*ws,valid)
 
 
-_TRITON_QUANT_MIN_ELEMENTS = 131_072
+# Measured on Hygon BW1000 (gfx936): below ~25M elements eager Triton launch
+# overhead makes Triton slower than native C++ quantize_out (0.32x-0.97x);
+# at >= 32M elements (e.g. prefill wo_a M >= 1024), Triton is 1.26x-1.42x faster.
+_TRITON_QUANT_MIN_ELEMENTS = 33_554_432
 _TRITON_QUANT_MAX_K = 8192
 _TRITON_QUANT_WARMED = set()
 
