@@ -33,12 +33,11 @@ def _reference_mix_stats(
         + hc_base[8:].view(1, 4, 4)
     )
     comb = torch.exp(comb - comb.amax(dim=-1, keepdim=True))
-    if sinkhorn_iters > 0:
-        comb = comb / comb.sum(dim=-1, keepdim=True) + hc_eps
+    comb = comb / comb.sum(dim=-1, keepdim=True) + hc_eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
+    for _ in range(max(sinkhorn_iters - 1, 0)):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_eps)
         comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
-        for _ in range(sinkhorn_iters - 1):
-            comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_eps)
-            comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
     return pre, post, comb
 
 
@@ -207,6 +206,30 @@ class TestMhcHcuTriton(CustomTestCase):
             self.assertLess((pre - pre_lo).abs().max().item(), 5e-6)
             self.assertLess((post - post_lo).abs().max().item(), 5e-6)
             self.assertLess((comb - comb_lo).abs().max().item(), 5e-6)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA/HIP device required")
+    def test_gpu_sinkhorn_iters_zero_and_one_match_reference(self):
+        """Regression test: sinkhorn_iters=0 must still perform the initial pass
+        like hc_split_sinkhorn_kernel."""
+        device = torch.device("cuda:0")
+        torch.manual_seed(11)
+        k = 20480
+        m = 1536
+        fn_w = torch.randn(24, k, device=device, dtype=torch.float32) * 0.02
+        hc_scale = torch.ones(3, device=device, dtype=torch.float32) * 0.1
+        hc_base = torch.randn(24, device=device, dtype=torch.float32) * 0.05
+        parts = _split_bf16_parts(fn_w)
+        x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 0.5
+        for iters in (0, 1):
+            pre_ref, post_ref, comb_ref = _reference_mix_stats(
+                x, fn_w, hc_scale, hc_base, sinkhorn_iters=iters
+            )
+            pre, post, comb = mhc_hcu_triton.hc_mix_stats_sinkhorn_bf16x3_hcu(
+                x, parts, hc_scale, hc_base, iters, 1e-20, 1e-6
+            )
+            self.assertLess((pre - pre_ref).abs().max().item(), 5e-6)
+            self.assertLess((post - post_ref).abs().max().item(), 5e-6)
+            self.assertLess((comb - comb_ref).abs().max().item(), 5e-6)
 
 
 if __name__ == "__main__":

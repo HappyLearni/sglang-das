@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 import threading
 from typing import Sequence, Tuple
+import weakref
 
 import torch
 import triton
@@ -111,9 +112,11 @@ def _hc_bf16x3_reduce_sinkhorn_kernel(
     post = 2.0 * tl.sigmoid(po * rsqrt * s1 + tl.load(B_ptr + 4 + idx4))
     cm = cm_p * rsqrt * s2 + tl.load(B_ptr + idx16)
     cm = tl.exp(cm - tl.max(cm, axis=1)[:, None])
-    if SINKHORN_ITERS > 0:
-        cm = cm / tl.sum(cm, axis=1)[:, None] + HC_EPS
-        cm = cm / (tl.sum(cm, axis=0)[None, :] + HC_EPS)
+    # Match hc_split_sinkhorn_kernel: always run the initial row/col pass, then
+    # max(SINKHORN_ITERS - 1, 0) additional passes (including SINKHORN_ITERS == 0).
+    cm = cm / tl.sum(cm, axis=1)[:, None] + HC_EPS
+    cm = cm / (tl.sum(cm, axis=0)[None, :] + HC_EPS)
+    if SINKHORN_ITERS > 1:
         for _ in tl.static_range(SINKHORN_ITERS - 1):
             cm = cm / (tl.sum(cm, axis=1)[:, None] + HC_EPS)
             cm = cm / (tl.sum(cm, axis=0)[None, :] + HC_EPS)
@@ -135,13 +138,18 @@ def _get_padded_bf16x3_weight(bf16_parts: Sequence[torch.Tensor]) -> torch.Tenso
         bf16_parts[0].device.index,
         tuple((p.data_ptr(), tuple(p.shape), _tensor_version(p)) for p in bf16_parts),
     )
+    storages = tuple(p.untyped_storage() for p in bf16_parts)
     cached = _weight_cache.get(key)
     if cached is not None:
-        return cached
+        refs, w_pad = cached
+        if all(r() is s for r, s in zip(refs, storages)):
+            return w_pad
     with _weight_cache_lock:
         cached = _weight_cache.get(key)
         if cached is not None:
-            return cached
+            refs, w_pad = cached
+            if all(r() is s for r, s in zip(refs, storages)):
+                return w_pad
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "HCU Triton BF16x3 mHC weight cache must be initialized before graph capture"
@@ -151,7 +159,7 @@ def _get_padded_bf16x3_weight(bf16_parts: Sequence[torch.Tensor]) -> torch.Tenso
             (k, _N_PAD), device=bf16_parts[0].device, dtype=torch.bfloat16
         )
         w_pad[:, : 3 * _NUM_OUTPUTS] = torch.cat([p.t() for p in bf16_parts], dim=1)
-        _weight_cache[key] = w_pad
+        _weight_cache[key] = (tuple(weakref.ref(s) for s in storages), w_pad)
         if len(_weight_cache) > _WEIGHT_CACHE_MAX_ENTRIES:
             _weight_cache.popitem(last=False)
         return w_pad
