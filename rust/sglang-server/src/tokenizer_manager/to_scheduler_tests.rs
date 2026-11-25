@@ -170,6 +170,7 @@ fn test_limits() -> Limits {
         num_reserved_tokens: 0,
         allow_auto_truncate: false,
         enable_return_hidden_states: false,
+        return_hidden_states_mode: None,
         default_priority: None,
     }
 }
@@ -401,9 +402,43 @@ fn hidden_states_gated_on_server_support() {
     assert!(validate(&mut req(false), &disabled).is_ok());
     let enabled = Limits {
         enable_return_hidden_states: true,
+        return_hidden_states_mode: Some("full".into()),
         ..test_limits()
     };
     assert!(validate(&mut req(true), &enabled).is_ok());
+
+    let last_only = Limits {
+        enable_return_hidden_states: true,
+        return_hidden_states_mode: Some("last".into()),
+        ..test_limits()
+    };
+    let err = validate(&mut req(true), &last_only).unwrap_err();
+    assert!(matches!(err, Error::Validation(_)));
+    assert!(
+        err.to_string().contains("--return-hidden-states-mode full"),
+        "message must name the full-mode flag: {err}"
+    );
+    assert!(validate(&mut req(false), &last_only).is_ok());
+}
+
+#[test]
+fn logprob_start_len_below_minus_one_is_rejected_when_returning_logprobs() {
+    let make = |return_logprob, start| {
+        let mut r = generate_req(32, SamplingParams::default());
+        if let RequestKind::Generate(g) = &mut r.kind {
+            g.return_logprob = return_logprob;
+            g.logprob_start_len = start;
+        }
+        r
+    };
+    let limits = test_limits();
+    assert!(matches!(
+        validate(&mut make(true, -2), &limits),
+        Err(Error::Validation(_))
+    ));
+    assert!(validate(&mut make(true, -1), &limits).is_ok());
+    assert!(validate(&mut make(true, 0), &limits).is_ok());
+    assert!(validate(&mut make(false, -2), &limits).is_ok());
 }
 
 /// End-to-end through `drive`: an over-context request is rejected on the way

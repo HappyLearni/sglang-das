@@ -548,7 +548,7 @@ fn match_validator_request_ring_accepts_live_or_backuped_tombstones_without_a_ti
         for device_only in [false, true] {
             let mut validator = swa.create_match_validator(&tc, device_only);
             assert!(validator(&tc, live));
-            assert!(validator(&tc, backuped));
+            assert_eq!(validator(&tc, backuped), !device_only);
             assert!(!validator(&tc, dead));
         }
     }
@@ -586,22 +586,52 @@ fn match_validator_hicache_with_a_host_pool_rejects_swa_tombstones() {
 }
 
 #[test]
-fn match_validator_request_ring_tombstone_acceptance_still_resets_the_window() {
+fn match_validator_request_ring_tombstone_acceptance_does_not_gate_short_child() {
     let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
     tc.set_hicache_enabled();
     let [live, c] = chain(&mut tc);
     tc.arena
         .set_device_value(live, FULL, Tensor::from_slice(&[0i64]));
+    tc.arena
+        .set_device_value(c, FULL, Tensor::from_slice(&[0i64]));
     set_swa_device(&mut tc, c);
     let swa = SwaComponent::new(&CacheInitParams {
         swa_req_ring: true,
         ..swa_params_with_window(2)
     });
     let mut validator = swa.create_match_validator(&tc, /* match_device_only = */ true);
-    // The accepted tombstone still zeroes the run: the next valued node
-    // sits below the window.
+    // With swa_req_ring=true, SWA does not gate prefix matching: both the
+    // FULL-resident tombstone and a short FULL-resident child below it match.
     assert!(validator(&tc, live));
-    assert!(!validator(&tc, c));
+    assert!(validator(&tc, c));
+}
+
+#[test]
+fn match_prefix_return_full_match_matches_donated_swa_tombstone() {
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 256,
+            swa_sliding_window_size: Some(128),
+            ..Default::default()
+        },
+        vec![FULL, SWA],
+    );
+    let key: Vec<i64> = (1..=512).collect();
+    let values: Vec<i64> = (1000..1512).collect();
+    // Page 0 ([0..256)) is SWA-evicted (tombstone); Page 1 ([256..512)) is live.
+    tc.insert(&insert_params_swa(&key, &values, 0, 256));
+
+    let prefix = key[..256].to_vec();
+    let default_hit = tc.match_prefix(&match_params(&prefix));
+    assert_eq!(default_hit.device_prefix_len, 0);
+    assert_eq!(default_hit.full_kv_hit_length, 256);
+
+    let full_hit = tc.match_prefix(&MatchPrefixParams {
+        return_full_match: true,
+        ..match_params(&prefix)
+    });
+    assert_eq!(full_hit.device_prefix_len, 256);
+    assert_eq!(full_hit.full_kv_hit_length, 256);
 }
 
 #[test]
@@ -727,6 +757,7 @@ fn finalize(
         &MatchPrefixParams {
             key: &Vec::new(),
             namespace: Default::default(),
+            return_full_match: false,
         },
         &[],
         0,
@@ -3968,6 +3999,7 @@ fn match_prefix_with_an_empty_key_on_a_swa_core_is_a_clean_miss() {
     let result = tc.match_prefix(&MatchPrefixParams {
         key: &Vec::new(),
         namespace: Default::default(),
+        return_full_match: false,
     });
     assert_eq!(result.device_prefix_len, 0);
     assert_eq!(result.swa_host_hit_length, 0);
@@ -5796,6 +5828,7 @@ fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
     MatchPrefixParams {
         key,
         namespace: Default::default(),
+        return_full_match: false,
     }
 }
 
@@ -6508,6 +6541,7 @@ fn finalize_branching(
             &MatchPrefixParams {
                 key: &Vec::new(),
                 namespace: Default::default(),
+                return_full_match: false,
             },
             &[],
             0,

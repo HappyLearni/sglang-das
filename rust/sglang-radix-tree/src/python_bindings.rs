@@ -581,22 +581,25 @@ pub struct MatchParamsBinding {
     pub key: Vec<i64>,
     pub extra_key: Option<String>,
     pub cache_salt: Option<String>,
+    pub return_full_match: bool,
 }
 
 #[pymethods]
 impl MatchParamsBinding {
     #[new]
-    #[pyo3(signature = (key, extra_key = None, cache_salt = None))]
+    #[pyo3(signature = (key, extra_key = None, cache_salt = None, return_full_match = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
         extra_key: Option<String>,
         cache_salt: Option<String>,
+        return_full_match: bool,
     ) -> PyResult<Self> {
         Ok(MatchParamsBinding {
             key: py_array_to_vec_i64(py, key)?,
             extra_key,
             cache_salt,
+            return_full_match,
         })
     }
 }
@@ -1128,6 +1131,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            return_full_match: params.return_full_match,
         };
         let result = py.detach(|| self.core().match_prefix(&params));
         MatchResultBinding::from_match_result(py, result)
@@ -2728,6 +2732,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             let params = MatchPrefixParams {
                 key: &key,
                 namespace: KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
+                return_full_match: false,
             };
             self.core().inspect_finalize_component_match_result(
                 component_type,

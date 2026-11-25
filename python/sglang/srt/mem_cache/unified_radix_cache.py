@@ -1277,6 +1277,39 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
+        swa = self.components.get(ComponentType.SWA)
+        if (
+            not is_finished
+            and self.decoder_swa_bounded_replay
+            and swa is not None
+            and swa.sliding_window_size
+            and getattr(swa, "gates_prefix_match", True)
+            and not getattr(req, "force_radix_leaf_creation", False)
+        ):
+            # Under decoder SWA bounded replay, canonical pages in the tree may
+            # carry unwritten late-layer SWA rows. Keep pages overlapping this
+            # live request's active SWA window [up_to - window, up_to) on
+            # private slots until the request finishes so dedup cannot overwrite
+            # them before the next chunk, decode step, streaming turn, or PD
+            # transfer.
+            safe_publish_end = (
+                max(0, len(token_ids) - swa.sliding_window_size) // self.page_size
+            ) * self.page_size
+            if safe_publish_end <= req.kv.cache_protected_len:
+                for comp in self._components_tuple:
+                    comp.cleanup_after_caching_req(
+                        req, is_finished=is_finished, insert_params=insert_params
+                    )
+                return
+            safe_cache_len = safe_publish_end + int(self.tree_core.is_eagle)
+            if safe_cache_len < effective_cache_len:
+                effective_cache_len = safe_cache_len
+                if (
+                    insert_params.swa_branching_seqlen is not None
+                    and safe_publish_end < insert_params.swa_branching_seqlen
+                ):
+                    insert_params.swa_branching_seqlen = None
+
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
             req.extra_key,
@@ -3804,8 +3837,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @staticmethod
     def _req_total_tokens(req) -> int:
-        total = len(getattr(req, "origin_input_ids", ())) + len(
-            getattr(req, "output_ids", ())
+        origin = getattr(req, "origin_input_ids", None)
+        output = getattr(req, "output_ids", None)
+        total = (len(origin) if origin is not None else 0) + (
+            len(output) if output is not None else 0
         )
         fill_ids = getattr(req, "full_untruncated_fill_ids", None)
         if fill_ids is not None:
@@ -3813,25 +3848,29 @@ class UnifiedRadixCache(BasePrefixCache):
         return total
 
     @staticmethod
-    def _req_reads_decoder_prompt_rows(req, total_tokens: int) -> bool:
+    def _is_dspark_spec() -> bool:
+        from sglang.srt.runtime_context import get_spec
+
+        return (
+            str(getattr(get_spec(), "speculative_algorithm", None) or "").upper()
+            == "DSPARK"
+        )
+
+    @classmethod
+    def _req_reads_decoder_prompt_rows(cls, req, total_tokens: int) -> bool:
         """Whether ``req`` runs decoder-replay late layers over the whole
         extend, reading prefix SWA rows that prior bounded-replay prefills
         never wrote."""
         if getattr(req, "return_logprob", False):
             start = getattr(req, "logprob_start_len", -1)
-            if start is not None and 0 <= start < total_tokens:
+            if start is not None and start != -1 and start < total_tokens:
                 return True
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             get_server_return_hidden_states_mode,
         )
-        from sglang.srt.runtime_context import get_spec
 
-        is_dspark = (
-            str(getattr(get_spec(), "speculative_algorithm", None) or "").upper()
-            == "DSPARK"
-        )
-        if not is_dspark:
+        if not cls._is_dspark_spec():
             if (
                 getattr(req, "return_hidden_states_mode", None)
                 == CaptureHiddenMode.FULL
@@ -3840,6 +3879,48 @@ class UnifiedRadixCache(BasePrefixCache):
             if get_server_return_hidden_states_mode() == CaptureHiddenMode.FULL:
                 return True
         return False
+
+    def isolates_full_hidden_state_batches(self) -> bool:
+        swa = self.components.get(ComponentType.SWA)
+        return bool(
+            getattr(self, "decoder_swa_bounded_replay", False)
+            and swa is not None
+            and swa.sliding_window_size
+            and getattr(swa, "gates_prefix_match", True)
+            and not self._is_dspark_spec()
+        )
+
+    def swa_prefix_match_limit(
+        self,
+        req=None,
+        *,
+        input_len: int,
+        return_full_match: bool = False,
+    ) -> Optional[int]:
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        swa = self.components.get(ComponentType.SWA)
+        if swa is None or not swa.sliding_window_size:
+            return None
+        session = getattr(self, "session", None)
+        lends_record = session is not None and session.will_lend_record(req)
+        if getattr(self, "decoder_swa_bounded_replay", False) and not lends_record:
+            if (
+                not return_full_match
+                and getattr(swa, "gates_prefix_match", True)
+                and req is not None
+                and input_len > 0
+                and self._req_reads_decoder_prompt_rows(req, input_len)
+            ):
+                return 0
+            return max(0, input_len - swa.sliding_window_size)
+        if not is_unified_kv_triton():
+            return None
+        if self.tree_core.has_swa_host_pool:
+            return None
+        return max(0, input_len - swa.sliding_window_size)
 
     def swa_reprefill_tail_tokens(self, req=None) -> int:
         """Tokens at the end of a matched prefix to re-prefill because their SWA

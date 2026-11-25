@@ -88,6 +88,7 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.cleanup import CleanupOutcomeUnknown, run_cleanup_step
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
+    effective_max_prefix_len,
     kv_to_page_indices,
     kv_to_page_num,
     release_kv_cache,
@@ -3329,7 +3330,9 @@ class SchedulerDisaggregationPrefillMixin:
             if req.skip_radix_cache_insert
             else min(
                 req.kv.cache_protected_len,
-                req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
+                effective_max_prefix_len(
+                    req, self.tree_cache, len(req.full_untruncated_fill_ids)
+                ),
             )
         )
         self._release_aborted_request(req)

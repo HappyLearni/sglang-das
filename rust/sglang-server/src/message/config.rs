@@ -169,6 +169,10 @@ pub struct ServerArgs {
     /// the scheduler simply won't produce them, so the request would 200 with the
     /// field silently missing.
     pub enable_return_hidden_states: bool,
+    /// Server hidden-state ceiling (`None`, `"last"`, or `"full"`).
+    /// Rust ingress only accepts boolean `return_hidden_states` (`true` = `FULL`),
+    /// so `"last"` must reject `return_hidden_states=true` just like Python.
+    pub return_hidden_states_mode: Option<String>,
     /// Output slots reserved per request on top of its input (eagle stores draft
     /// tokens there). Not a `server_args` field — `TokenizerManager` derives it and
     /// `RustServer._build_server_args` stamps it in, so both sides count alike.
@@ -246,6 +250,7 @@ impl ServerArgs {
         accelerator,
         num_accelerators,
         metrics,
+        return_hidden_states_mode = None,
     ))]
     // The parameter list IS the schema; one keyword per field, all required.
     #[allow(clippy::too_many_arguments)]
@@ -293,6 +298,7 @@ impl ServerArgs {
         accelerator: Option<String>,
         num_accelerators: u32,
         metrics: Option<MetricsConfig>,
+        return_hidden_states_mode: Option<String>,
     ) -> Self {
         Self {
             model_path,
@@ -326,6 +332,7 @@ impl ServerArgs {
             limit_mm_data_per_request,
             allow_auto_truncate,
             enable_return_hidden_states,
+            return_hidden_states_mode,
             num_reserved_tokens,
             tokenizer_model_max_length,
             version,
@@ -379,6 +386,7 @@ impl Default for ServerArgs {
             limit_mm_data_per_request: BTreeMap::new(),
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
+            return_hidden_states_mode: None,
             num_reserved_tokens: 0,
             tokenizer_model_max_length: -1,
             version: String::new(),

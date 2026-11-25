@@ -62,6 +62,12 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
         if !g.has_multimodal() {
             validate_input_ids(g, vocab_size)?;
         }
+        if g.return_logprob && g.logprob_start_len < -1 {
+            return Err(Error::Validation(format!(
+                "logprob_start_len={} is invalid. Please use a logprob_start_len >= -1.",
+                g.logprob_start_len
+            )));
+        }
         if let Some(ids) = &g.token_ids_logprob {
             for &id in ids {
                 if id < 0 || id as u64 >= vocab_size {
@@ -86,17 +92,26 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
         }
     }
 
-    // The scheduler only computes hidden states when launched for it, so without
-    // this the request would 200 with `meta_info.hidden_states` silently absent
-    // (Python `TokenizerManager._validate_one_request`).
-    if !limits.enable_return_hidden_states
-        && matches!(&req.kind, RequestKind::Generate(g) if g.return_hidden_states)
-    {
-        return Err(Error::Validation(
-            "The server is not configured to return the hidden states. \
-             Please set `--enable-return-hidden-states` to enable this feature."
-                .into(),
-        ));
+    // The scheduler only computes hidden states up to the configured ceiling,
+    // so reject requests that ask for FULL hidden states (`return_hidden_states=true`)
+    // when hidden states are disabled or capped at `"last"` (matching Python
+    // `TokenizerManager._validate_one_request`).
+    if matches!(&req.kind, RequestKind::Generate(g) if g.return_hidden_states) {
+        if limits.return_hidden_states_mode.as_deref() == Some("last") {
+            return Err(Error::Validation(
+                "The requested return_hidden_states mode exceeds the server maximum `last`. \
+                 Please launch with `--return-hidden-states-mode full` to allow \
+                 return_hidden_states=True."
+                    .into(),
+            ));
+        }
+        if !limits.enable_return_hidden_states {
+            return Err(Error::Validation(
+                "The server is not configured to return the hidden states. \
+                 Please set `--enable-return-hidden-states` to enable this feature."
+                    .into(),
+            ));
+        }
     }
 
     Ok(())

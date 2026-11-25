@@ -1449,6 +1449,7 @@ fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
     MatchPrefixParams {
         key,
         namespace: Default::default(),
+        return_full_match: false,
     }
 }
 
@@ -1460,6 +1461,7 @@ fn match_params_in_namespace<'a>(
     MatchPrefixParams {
         key,
         namespace: KeyNamespaceRef::new(extra_key, cache_salt),
+        return_full_match: false,
     }
 }
 
@@ -1627,6 +1629,7 @@ fn insert_first_write_creates_the_namespace() {
     let result = tc.match_prefix(&MatchPrefixParams {
         key: &vec![1, 2],
         namespace: KeyNamespaceRef::new(Some("lora-1"), None),
+        return_full_match: false,
     });
     assert_eq!(result.device_prefix_len, 0);
     assert_eq!(result.best_match_node_id, tc.root_node_handle(None));
@@ -1640,6 +1643,7 @@ fn match_prefix_empty_query_anchors_at_the_root() {
         let result = tc.match_prefix(&MatchPrefixParams {
             key: &vec![],
             namespace: KeyNamespaceRef::new(extra_key, None),
+            return_full_match: false,
         });
         assert_eq!(result.best_match_node_id, root_handle);
         assert_eq!(result.last_device_node_id, root_handle);
@@ -4095,6 +4099,7 @@ fn prefetch_anchor_info_maps_the_namespace() {
         .match_prefix(&MatchPrefixParams {
             key: &vec![7, 8],
             namespace: KeyNamespaceRef::new(Some("chat"), Some("tenant-a")),
+            return_full_match: false,
         })
         .best_match_node_id;
     assert_eq!(
@@ -4118,6 +4123,7 @@ fn prefetch_anchor_info_maps_the_namespace() {
         .match_prefix(&MatchPrefixParams {
             key: &vec![7],
             namespace: KeyNamespaceRef::new(Some("chat"), Some("tenant-a")),
+            return_full_match: false,
         })
         .best_match_node_id;
     assert_ne!(split_mid, salted);
@@ -5420,24 +5426,28 @@ fn dfs_weight_order_groups_the_heaviest_subtree_first() {
         .match_prefix(&MatchPrefixParams {
             key: &vec![1, 99],
             namespace: KeyNamespaceRef::default(),
+            return_full_match: false,
         })
         .last_device_node_id;
     let leaf_a1 = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![1, 10],
             namespace: KeyNamespaceRef::default(),
+            return_full_match: false,
         })
         .last_device_node_id;
     let leaf_a2 = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![1, 11],
             namespace: KeyNamespaceRef::default(),
+            return_full_match: false,
         })
         .last_device_node_id;
     let leaf_b = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![2, 20],
             namespace: KeyNamespaceRef::default(),
+            return_full_match: false,
         })
         .last_device_node_id;
 
@@ -5503,6 +5513,7 @@ fn insert_into_a_named_namespace_is_isolated() {
     let hit = tc.match_prefix(&MatchPrefixParams {
         key: &vec![1, 2],
         namespace: KeyNamespaceRef::new(Some("lora-1"), None),
+        return_full_match: false,
     });
     assert!(matched_device_indices(&tc, &hit).equal(&Tensor::from_slice(&[10i64, 11])));
 }
@@ -8303,6 +8314,7 @@ fn match_prefix_on_an_unknown_namespace_allocates_nothing() {
     let result = tc.match_prefix(&MatchPrefixParams {
         key: &vec![1, 2, 3],
         namespace: KeyNamespaceRef::new(Some("ghost"), None),
+        return_full_match: false,
     });
     assert_eq!(result.device_prefix_len, 0);
     assert_eq!(tc.arena.len(), arena_len);
@@ -8331,6 +8343,7 @@ fn refresh_dispatches_fire_per_walk_phase_in_a_namespace() {
         .match_prefix(&MatchPrefixParams {
             key: &vec![7, 8],
             namespace: KeyNamespaceRef::new(Some("chat"), None),
+            return_full_match: false,
         })
         .best_match_node_id;
     let refreshes = recorder.refreshes.lock().unwrap();

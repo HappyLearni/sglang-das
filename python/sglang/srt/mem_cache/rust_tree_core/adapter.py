@@ -748,13 +748,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key
-        result = self._binding.match_prefix(
-            self._bindings.MatchParamsBinding(
-                key=_radix_key_buffer(key),
-                extra_key=key.extra_key,
-                cache_salt=key.cache_salt,
-            )
-        )
+        kwargs = {
+            "key": _radix_key_buffer(key),
+            "extra_key": key.extra_key,
+            "cache_salt": key.cache_salt,
+        }
+        if params.return_full_match:
+            kwargs["return_full_match"] = True
+        result = self._binding.match_prefix(self._bindings.MatchParamsBinding(**kwargs))
         return _match_result_from_binding(result)
 
     def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:

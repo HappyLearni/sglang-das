@@ -311,10 +311,14 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
+    effective_max_prefix_len,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -3750,6 +3754,13 @@ class Scheduler(
         else:
             req.logprob_start_len = recv_req.logprob_start_len
 
+        if req.logprob_start_len < -1:
+            error_msg = f"{req.logprob_start_len=} is invalid. Please use a logprob_start_len >= -1."
+            req.logprob_start_len = -1
+            req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+
         if req.logprob_start_len > len(req.origin_input_ids):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
             req.logprob_start_len = -1
@@ -4072,9 +4083,11 @@ class Scheduler(
                     and tree_cache.get_last_hash_value(last_host_node) is not None
                 )
             ):
-                match_end = req._compute_max_prefix_len(
-                    len(req.full_untruncated_fill_ids)
+                match_end = effective_max_prefix_len(
+                    req, tree_cache, len(req.full_untruncated_fill_ids)
                 )
+                if match_end <= matched_len:
+                    return None
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
                 prefix_keys = (
                     tree_cache.get_prefix_hash_values(last_host_node)
@@ -4845,6 +4858,34 @@ class Scheduler(
 
         return res
 
+    def _can_share_bounded_replay_hidden_mode(
+        self, req: Req, admitted_reqs: List[Req], running_batch: ScheduleBatch
+    ) -> bool:
+        """Under decoder SWA bounded replay with paged SWA (outside DSpark), a
+        batch-wide CaptureHiddenMode.FULL marks every request in the forward
+        batch whole_extend=True, which would make a non-FULL peer with a cached
+        prefix read unwritten late-layer SWA rows. Keep FULL requests isolated
+        from non-FULL peers."""
+        isolate_fn = getattr(
+            self.tree_cache, "isolates_full_hidden_state_batches", None
+        )
+        if isolate_fn is None or not isolate_fn():
+            return True
+        req_full = req.return_hidden_states_mode == CaptureHiddenMode.FULL
+        if admitted_reqs and (
+            req_full
+            != (admitted_reqs[0].return_hidden_states_mode == CaptureHiddenMode.FULL)
+        ):
+            return False
+        if (
+            self.is_mixed_chunk
+            and not running_batch.is_empty()
+            and running_batch.return_hidden_states_mode == CaptureHiddenMode.FULL
+            and not req_full
+        ):
+            return False
+        return True
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -5026,6 +5067,11 @@ class Scheduler(
             if adder.can_run_list and (
                 (req.token_indices_to_pool is not None)
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
+            ):
+                continue
+
+            if not self._can_share_bounded_replay_hidden_mode(
+                req, adder.can_run_list, running_batch
             ):
                 continue
 
