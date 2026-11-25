@@ -16,9 +16,34 @@ from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
     rmsnorm_row_chunk,
     row_major_2d,
 )
-from sglang.srt.utils.common import is_gfx95_supported, is_hip
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.utils.common import get_bool_env_var, is_gfx95_supported, is_hcu, is_hip
 
 _is_hip = is_hip()
+_is_hcu = is_hcu()
+_HC_FN_BF16X2_CACHE: dict = {}
+
+
+def _hcu_hc_boundary_bf16x2_enabled() -> bool:
+    return (
+        _is_hcu
+        and get_bool_env_var("SGLANG_HCU_MHC_BOUNDARY_BF16X2", "true")
+        and not is_batch_invariant_mode_enabled()
+    )
+
+
+def _get_hc_fn_bf16x2(hc_fn: torch.Tensor) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    key = (hc_fn.data_ptr(), hc_fn.shape, hc_fn.stride(), hc_fn.device.index)
+    version = hc_fn._version
+    entry = _HC_FN_BF16X2_CACHE.get(key)
+    if entry is not None and entry[0] == version:
+        return entry[1], entry[2]
+    if hc_fn.is_cuda and torch.cuda.is_current_stream_capturing():
+        return None
+    w_hi = hc_fn.to(torch.bfloat16).contiguous()
+    w_lo = (hc_fn - w_hi.float()).to(torch.bfloat16).contiguous()
+    _HC_FN_BF16X2_CACHE[key] = (version, w_hi, w_lo)
+    return w_hi, w_lo
 # CDNA has no tf32: the mixing dot runs in ieee fp32 (the CUDA kernel uses tf32x3)
 _HC_MIX_DOT_PRECISION = "ieee"
 
@@ -844,6 +869,124 @@ def _hc_boundary_partial_kernel(
         )
 
 
+@triton.jit
+def _hc_boundary_partial_bf16x2_kernel(
+    x_ptr,
+    res_ptr,
+    post_in_ptr,
+    comb_in_ptr,
+    pre_prev_ptr,
+    w_hi_ptr,
+    w_lo_ptr,
+    res_out_ptr,
+    y_ptr,
+    part_mix_ptr,
+    part_sq_ptr,
+    M,
+    H,
+    x_stride_m,
+    res_stride_m,
+    w_stride_n,
+    HC: tl.constexpr,
+    MIX: tl.constexpr,
+    MIX_PAD: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_POST: tl.constexpr,
+    HAS_COMBINE: tl.constexpr,
+):
+    """HCU BF16x2 MFMA variant of _hc_boundary_partial_kernel.
+
+    Splits the fp32 mixing weight into ``w_hi + w_lo`` (both bf16) and runs two
+    native bf16 MFMA dots against bf16 activations, preserving ~1e-5 fp32
+    accuracy while avoiding slow fp32 MFMA on gfx936.
+    """
+    tl.static_assert(HC == 4, "the weight tiles are indexed for HC == 4")
+    pid_m = tl.program_id(0)
+    pid_t = tl.program_id(1)
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    mask_m = offs_m < M
+    offs_h = pid_t * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_n = tl.arange(0, MIX_PAD)
+    mask_n = offs_n < MIX
+    m2 = mask_m[:, None]
+    w_off = offs_n[None, :] * w_stride_n + offs_h[:, None]
+
+    if HAS_POST:
+        xa = tl.load(
+            x_ptr + offs_m[:, None] * x_stride_m + offs_h[None, :], mask=m2, other=0.0
+        ).to(tl.float32)
+        r_off = offs_m[:, None] * res_stride_m + offs_h[None, :]
+        r0 = tl.load(res_ptr + r_off + 0 * H, mask=m2, other=0.0).to(tl.float32)
+        r1 = tl.load(res_ptr + r_off + 1 * H, mask=m2, other=0.0).to(tl.float32)
+        r2 = tl.load(res_ptr + r_off + 2 * H, mask=m2, other=0.0).to(tl.float32)
+        r3 = tl.load(res_ptr + r_off + 3 * H, mask=m2, other=0.0).to(tl.float32)
+        cj = tl.arange(0, HC)
+        post_tile = tl.load(
+            post_in_ptr + offs_m[:, None] * HC + cj[None, :], mask=m2, other=0.0
+        ).to(tl.float32)
+        cc = tl.arange(0, HC * HC)
+        comb_tile = tl.load(
+            comb_in_ptr + offs_m[:, None] * (HC * HC) + cc[None, :], mask=m2, other=0.0
+        ).to(tl.float32)
+    if HAS_COMBINE:
+        pj = tl.arange(0, HC)
+        pre_tile = tl.load(
+            pre_prev_ptr + offs_m[:, None] * HC + pj[None, :], mask=m2, other=0.0
+        ).to(tl.float32)
+        y = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
+
+    acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
+    sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for k in tl.static_range(HC):
+        if HAS_POST:
+            pk = tl.sum(tl.where((cj == k)[None, :], post_tile, 0.0), axis=1)
+            c0 = tl.sum(tl.where((cc == 0 * HC + k)[None, :], comb_tile, 0.0), axis=1)
+            c1 = tl.sum(tl.where((cc == 1 * HC + k)[None, :], comb_tile, 0.0), axis=1)
+            c2 = tl.sum(tl.where((cc == 2 * HC + k)[None, :], comb_tile, 0.0), axis=1)
+            c3 = tl.sum(tl.where((cc == 3 * HC + k)[None, :], comb_tile, 0.0), axis=1)
+            v = xa * pk[:, None]
+            v += r0 * c0[:, None]
+            v += r1 * c1[:, None]
+            v += r2 * c2[:, None]
+            v += r3 * c3[:, None]
+            vb = v.to(res_out_ptr.dtype.element_ty)
+            tl.store(
+                res_out_ptr + offs_m[:, None] * (HC * H) + k * H + offs_h[None, :],
+                vb,
+                mask=m2,
+            )
+            xt = vb.to(tl.float32)
+        else:
+            vb = tl.load(
+                x_ptr + offs_m[:, None] * x_stride_m + k * H + offs_h[None, :],
+                mask=m2,
+                other=0.0,
+            )
+            xt = vb.to(tl.float32)
+        if HAS_COMBINE:
+            pp = tl.sum(tl.where((pj == k)[None, :], pre_tile, 0.0), axis=1)
+            y += pp[:, None] * xt
+        wh = tl.load(w_hi_ptr + w_off + k * H, mask=mask_n[None, :], other=0.0)
+        wl = tl.load(w_lo_ptr + w_off + k * H, mask=mask_n[None, :], other=0.0)
+        acc += tl.dot(vb, wh)
+        acc += tl.dot(vb, wl)
+        sq += tl.sum(xt * xt, axis=1)
+
+    tl.store(
+        part_mix_ptr + (pid_t * M + offs_m[:, None]) * MIX + offs_n[None, :],
+        acc,
+        mask=m2 & mask_n[None, :],
+    )
+    tl.store(part_sq_ptr + pid_t * M + offs_m, sq, mask=mask_m)
+    if HAS_COMBINE:
+        tl.store(
+            y_ptr + offs_m[:, None] * H + offs_h[None, :],
+            y.to(y_ptr.dtype.element_ty),
+            mask=m2,
+        )
+
+
 # the gfx950 prefill kernel is bitwise the Triton kernel per row: the switch below is a speed choice
 _HC_BOUNDARY_PREFILL_MIN_M = 1024
 
@@ -929,6 +1072,43 @@ def _hc_boundary_partials(
     mix_pad = max(16, triton.next_power_of_2(mix))
     block_m = _HC_BOUNDARY_BLOCK_M
     grid_m = triton.cdiv(m, block_m)
+    if (
+        _hcu_hc_boundary_bf16x2_enabled()
+        and hc_mult == 4
+        and residual.dtype == torch.bfloat16
+        and hc_fn.dtype == torch.float32
+    ):
+        bf16_pair = _get_hc_fn_bf16x2(hc_fn)
+        if bf16_pair is not None:
+            w_hi, w_lo = bf16_pair
+            _hc_boundary_partial_bf16x2_kernel[(grid_m, num_slices)](
+                x if has_post else residual,
+                residual,
+                post_in if has_post else placeholder,
+                comb_in if has_post else placeholder,
+                pre_prev if has_combine else placeholder,
+                w_hi,
+                w_lo,
+                residual_out if has_post else placeholder,
+                y if has_combine else placeholder,
+                part_mix,
+                part_sq,
+                m,
+                h,
+                x.stride(0) if has_post else residual.stride(0),
+                residual.stride(0),
+                w_hi.stride(0),
+                HC=hc_mult,
+                MIX=mix,
+                MIX_PAD=mix_pad,
+                BLOCK_M=block_m,
+                BLOCK_K=_HC_BOUNDARY_BLOCK_K,
+                HAS_POST=has_post,
+                HAS_COMBINE=has_combine,
+                num_warps=_HC_BOUNDARY_NUM_WARPS,
+                num_stages=_HC_BOUNDARY_NUM_STAGES,
+            )
+            return part_mix, part_sq
     _hc_boundary_partial_kernel[(grid_m, num_slices)](
         x if has_post else residual,
         residual,
