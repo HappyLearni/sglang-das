@@ -1806,6 +1806,7 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         qkv_a: Optional[torch.Tensor] = None,
         q_rope: Optional[torch.Tensor] = None,
+        kv: Optional[torch.Tensor] = None,
     ) -> None:
         """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
 
@@ -1823,10 +1824,11 @@ class MQALayer(MqaAttentionBase):
                 layer_id=self.layer_id, swa_k=kv, forward_batch=forward_batch
             )
             return
-        if qkv_a is not None:
-            kv = qkv_a[..., self.q_lora_rank :]
-        else:
-            kv, _ = self.wkv(x)
+        if kv is None:
+            if qkv_a is not None:
+                kv = qkv_a[..., self.q_lora_rank :]
+            else:
+                kv, _ = self.wkv(x)
         token_to_kv_pool = get_token_to_kv_pool()
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -2458,7 +2460,30 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
         else:
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+            kv_pre: Optional[torch.Tensor] = None
             if _is_hip and not overlap_layer_split_prefetch:
+                fuse_use_cp = use_cp or forward_batch.encoder_swa_replay
+                if qkv_a is not None:
+                    kv_dtype = qkv_a.dtype
+                elif (
+                    not in_replay_tail_graph()
+                    and _hip.fuses_q_rope_into_k_store(
+                        self, q_out, unified=unified, use_cp=fuse_use_cp
+                    )
+                    and (
+                        _is_gfx95_supported
+                        or _hip._hcu_kv_pool_supports_fused_q_rope(
+                            self, q_dtype=q_lora.dtype
+                        )
+                    )
+                ):
+                    # When WQA and WKV are split, x_linear may be a pre-quantized
+                    # operand (Int8PerTokenInput or FP8 tuple) without `.dtype`.
+                    # Project WKV once here and decide fusion from the real kv dtype.
+                    kv_pre, _ = self.wkv(x_linear)
+                    kv_dtype = kv_pre.dtype
+                else:
+                    kv_dtype = None
                 q, q_lora, fuse_q_rope = _hip.compute_q_b(
                     self,
                     q_lora,
@@ -2466,8 +2491,8 @@ class MQALayer(MqaAttentionBase):
                     positions,
                     q_out,
                     unified,
-                    use_cp or forward_batch.encoder_swa_replay,
-                    kv_dtype=qkv_a.dtype if qkv_a is not None else x_linear.dtype,
+                    fuse_use_cp,
+                    kv_dtype=kv_dtype,
                 )
             elif not overlap_layer_split_prefetch:
                 q = self._compute_q_b(q_for_wqb, positions, q_out)
@@ -2534,6 +2559,7 @@ class MQALayer(MqaAttentionBase):
                     attn_backend,
                     qkv_a=qkv_a,
                     q_rope=q if fuse_q_rope else None,
+                    kv=kv_pre,
                 )
                 kv = None
 

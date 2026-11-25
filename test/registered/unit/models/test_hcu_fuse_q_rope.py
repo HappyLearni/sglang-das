@@ -146,6 +146,148 @@ class TestHcuFuseQRopeDispatch(unittest.TestCase):
             self.assertFalse(fused_wqb)
             self.assertEqual(q_out_fp16.dtype, torch.float16)
 
+    def test_forward_prepare_split_wqa_wkv_with_prequantized_operands(self):
+        """Regression test: entering MQALayer._forward_prepare with fuse_wqa_wkv=False
+        and pre-quantized x_quant (Int8PerTokenInput or FP8 tuple, neither having `.dtype`)
+        must decide Q-RoPE fusion from the actual WKV output dtype without AttributeError
+        and without running WKV twice."""
+        from types import MethodType
+
+        from sglang.srt.layers.fused_rms_quant import Int8PerTokenInput
+        from sglang.srt.models import deepseek_v4 as dsv4_mod
+
+        B, H_q, D, Q_LORA, K_IN = 4, 16, 512, 1536, 5120
+        x_bf16 = torch.zeros((B, K_IN), dtype=torch.bfloat16)
+        int8_operand = Int8PerTokenInput(
+            x=x_bf16,
+            q=torch.zeros((B, K_IN), dtype=torch.int8),
+            scale=torch.ones((B, 1), dtype=torch.float32),
+        )
+        fp8_operand = (
+            torch.zeros((B, K_IN), dtype=torch.uint8),
+            torch.ones((B, 1), dtype=torch.float32),
+        )
+
+        for operand_name, x_quant in (
+            ("Int8PerTokenInput", int8_operand),
+            ("fp8_tuple", fp8_operand),
+        ):
+            for kv_out_dtype, expect_fused in (
+                (torch.bfloat16, True),
+                (torch.float16, False),
+            ):
+                with self.subTest(operand=operand_name, kv_dtype=kv_out_dtype):
+                    wkv_calls = []
+                    store_calls = []
+                    compute_qb_calls = []
+
+                    def _wkv(inp, _dtype=kv_out_dtype, _calls=wkv_calls):
+                        _calls.append(inp)
+                        return torch.zeros((B, D), dtype=_dtype), None
+
+                    def _set_swa_store(**kwargs):
+                        store_calls.append(kwargs)
+
+                    pool = SimpleNamespace(
+                        is_bf16_attention_kv_cache=False,
+                        uniform_fp8=False,
+                        set_swa_key_buffer_radix_fused_norm_rope=_set_swa_store,
+                    )
+                    layer = SimpleNamespace(
+                        fuse_wqa_wkv=False,
+                        q_lora_rank=Q_LORA,
+                        head_dim=D,
+                        rope_head_dim=64,
+                        q_head_norm=False,
+                        n_local_heads=H_q,
+                        layer_id=0,
+                        eps=1e-6,
+                        freqs_cis=torch.ones((16, 32), dtype=torch.complex64),
+                        kv_norm=SimpleNamespace(
+                            weight=torch.ones((D,), dtype=torch.bfloat16)
+                        ),
+                        q_norm=SimpleNamespace(
+                            weight=torch.ones((Q_LORA,), dtype=torch.bfloat16)
+                        ),
+                        use_fused_qk_norm_rope=False,
+                        compress_ratio=4,
+                        compressor=None,
+                        indexer=None,
+                        wq_a=lambda inp: (
+                            torch.zeros((B, Q_LORA), dtype=torch.bfloat16),
+                            None,
+                        ),
+                        wkv=_wkv,
+                        _normalize_q_lora=lambda ql: (ql, ql),
+                        wq_b=lambda ql: (
+                            torch.zeros((B, H_q * D), dtype=torch.bfloat16),
+                            None,
+                        ),
+                        _compute_q_b=lambda ql, pos, q_out: (
+                            compute_qb_calls.append(True)
+                            or torch.ones((B, H_q, D), dtype=torch.bfloat16)
+                        ),
+                    )
+                    layer._compute_kv_to_cache = MethodType(
+                        dsv4_mod.MQALayer._compute_kv_to_cache, layer
+                    )
+                    fwd_batch = SimpleNamespace(
+                        forward_mode=SimpleNamespace(
+                            is_context_parallel_extend=lambda: False,
+                            is_decode_or_idle=lambda: True,
+                            is_target_verify=lambda: False,
+                        ),
+                        encoder_swa_replay=False,
+                    )
+                    attn_backend = SimpleNamespace(
+                        get_swa_out_cache_loc=lambda fb: torch.arange(
+                            B, dtype=torch.int32
+                        )
+                    )
+
+                    with (
+                        patch.object(dsv4_mod, "_is_hip", True),
+                        patch.object(dsv4_mod, "_is_hcu", True),
+                        patch.object(dsv4_mod, "_is_npu", False),
+                        patch.object(dsv4_mod, "_is_gfx95_supported", False),
+                        patch.object(dsv4_mod, "dsa_use_prefill_cp", return_value=False),
+                        patch.object(
+                            dsv4_mod, "in_replay_tail_graph", return_value=False
+                        ),
+                        patch.object(
+                            dsv4_mod, "get_token_to_kv_pool", return_value=pool
+                        ),
+                        patch.object(mod, "_is_hcu", True),
+                        patch.object(mod, "_is_gfx95_supported", False),
+                        patch.object(mod, "in_replay_tail_graph", return_value=False),
+                        patch.object(mod, "get_token_to_kv_pool", return_value=pool),
+                        patch.dict(
+                            os.environ, {"SGLANG_HCU_FUSE_Q_ROPE": "1"}, clear=False
+                        ),
+                    ):
+                        q, kv = dsv4_mod.MQALayer._forward_prepare(
+                            layer,
+                            x_bf16,
+                            torch.arange(B, dtype=torch.int64),
+                            fwd_batch,
+                            attn_backend,
+                            x_quant=x_quant,
+                        )
+
+                    self.assertEqual(q.shape, (B, H_q, D))
+                    self.assertIsNone(kv)
+                    self.assertEqual(len(wkv_calls), 1)
+                    self.assertIs(wkv_calls[0], x_quant)
+                    self.assertEqual(len(store_calls), 1)
+                    self.assertEqual(store_calls[0]["kv"].dtype, kv_out_dtype)
+                    if expect_fused:
+                        self.assertIn("q", store_calls[0])
+                        self.assertIs(store_calls[0]["q"], q)
+                        self.assertEqual(len(compute_qb_calls), 0)
+                    else:
+                        self.assertNotIn("q", store_calls[0])
+                        self.assertEqual(len(compute_qb_calls), 1)
+
 
 @unittest.skipUnless(
     torch.cuda.is_available() and is_hip() and is_hcu(),
