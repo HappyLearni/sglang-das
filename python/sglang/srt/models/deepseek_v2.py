@@ -1700,11 +1700,20 @@ class DeepseekV2MoE(nn.Module):
                 if _is_hcu and not self.is_hash and not self.is_nextn and not use_vision_topk
                 else None
             )
-            router_logits = (
-                fused_topk_output.router_logits
-                if fused_topk_output is not None
-                else self.gate(hidden_states, forward_batch=forward_batch)
-            )
+            if fused_topk_output is not None:
+                router_logits = fused_topk_output.router_logits
+                router_logits_partials = None
+            elif _is_hip:
+                router_logits, router_logits_partials = _hip_moe.forward_gate(
+                    self,
+                    hidden_states,
+                    None,
+                    fused_gate=not use_vision_topk and not self.is_hash,
+                    forward_batch=forward_batch,
+                )
+            else:
+                router_logits = self.gate(hidden_states, forward_batch=forward_batch)
+                router_logits_partials = None
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
@@ -1726,6 +1735,8 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
+            if router_logits_partials is not None:
+                topk_kwargs["router_logits_partials"] = router_logits_partials
             if fused_topk_output is not None:
                 topk_output = fused_topk_output
                 self.topk.record_mega_gate_output(topk_output)

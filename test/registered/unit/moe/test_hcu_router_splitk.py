@@ -156,6 +156,36 @@ class TestHcuRouterSplitKDevice(unittest.TestCase):
         self.assertTrue(torch.equal(g_w, ref_w))
         self.assertTrue(torch.equal(g_logits, ref_logits))
 
+    def test_split_k_router_deepep_finalize_padding_and_int64(self):
+        device = torch.device("cuda")
+        gen = torch.Generator(device=device).manual_seed(99)
+        x = torch.randn((8, 5120), device=device, generator=gen).to(torch.bfloat16)
+        w = (torch.randn((384, 5120), device=device, generator=gen) * 0.02).to(
+            torch.bfloat16
+        )
+        bias = torch.randn((384,), device=device, generator=gen, dtype=torch.float32) * 0.2
+        n_valid = torch.tensor([5], dtype=torch.int32, device=device)
+
+        _, ref_w, ref_ids = self._ref_sqrtsoftplus_topk(x[:5], w, bias, 6, 2.5)
+        partials = router_gemv_hip.rocm_router_gemv_split_k(x, w)
+        logits = torch.empty((8, 384), dtype=torch.float32, device=device)
+        out_w, out_ids = rocm_router_gate_mod.rocm_router_gate(
+            logits,
+            bias,
+            6,
+            True,
+            2.5,
+            partials=partials,
+            sqrtsoftplus_log1p=True,
+            num_token_non_padded=n_valid,
+            output_int64=True,
+        )
+        self.assertEqual(out_ids.dtype, torch.int64)
+        self.assertTrue(torch.equal(out_ids[:5], ref_ids.to(torch.int64)))
+        self.assertLess((out_w[:5] - ref_w).abs().max().item(), 1e-5)
+        self.assertTrue(torch.all(out_ids[5:] == -1))
+        self.assertTrue(torch.all(out_w[5:] == 0.0))
+
 
 if __name__ == "__main__":
     unittest.main()

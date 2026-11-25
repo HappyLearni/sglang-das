@@ -46,7 +46,12 @@ def batch_has_images(forward_batch) -> bool:
 
 
 def forward_gate(
-    moe, hidden_states: torch.Tensor, gemm_output_zero_allocator, *, fused_gate: bool
+    moe,
+    hidden_states: torch.Tensor,
+    gemm_output_zero_allocator=None,
+    *,
+    fused_gate: bool,
+    forward_batch=None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """The router logits of moe (a DeepseekV2MoE) and, on the split-K decode router, the
     partials moe.topk sums into them; fused_gate=False when anything else reads them."""
@@ -54,4 +59,6 @@ def forward_gate(
         logits_and_partials = rocm_dsv3_router_split_k(moe.gate, hidden_states)
         if logits_and_partials is not None:
             return logits_and_partials
+    if forward_batch is not None:
+        return moe.gate(hidden_states, forward_batch=forward_batch), None
     return moe.gate(hidden_states, gemm_output_zero_allocator), None
