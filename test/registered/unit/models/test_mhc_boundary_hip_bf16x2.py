@@ -59,7 +59,7 @@ class TestMhcBoundaryHipBf16x2Device(unittest.TestCase):
         hc_scale = torch.ones((3,), device=device, dtype=torch.float32)
         hc_base = torch.zeros((24,), device=device, dtype=torch.float32)
 
-        for m in (6, 16, 48, 64):
+        for m in (64, 512, 1024):
             x = torch.randn((m, 5120), device=device, generator=gen).to(torch.bfloat16)
             res = torch.randn((m, 4, 5120), device=device, generator=gen).to(torch.bfloat16)
             post = torch.rand((m, 4), device=device, generator=gen, dtype=torch.float32)
@@ -83,14 +83,17 @@ class TestMhcBoundaryHipBf16x2Device(unittest.TestCase):
             self.assertTrue(torch.equal(out_y, ref_y), f"M={m} y mismatch")
             self.assertTrue(torch.equal(out_c.part_sq, ref_c.part_sq), f"M={m} sq mismatch")
             mix_err = (out_c.part_mix.sum(0) - ref_c.part_mix.sum(0)).abs().max().item()
-            self.assertLess(mix_err, 1e-4, f"M={m} mix_err={mix_err}")
+            if m < mod._HCU_MHC_BOUNDARY_BF16X2_MIN_M:
+                self.assertEqual(mix_err, 0.0, f"M={m} below threshold must use FP32 path")
+            else:
+                self.assertLess(mix_err, 1e-4, f"M={m} mix_err={mix_err}")
 
-        # Verify HIP Graph capture + replay uses cached bf16x2 weights without allocating.
-        x = torch.randn((16, 5120), device=device, generator=gen).to(torch.bfloat16)
-        res = torch.randn((16, 4, 5120), device=device, generator=gen).to(torch.bfloat16)
-        post = torch.rand((16, 4), device=device, generator=gen, dtype=torch.float32)
-        comb = torch.rand((16, 4, 4), device=device, generator=gen, dtype=torch.float32)
-        pre = torch.rand((16, 4), device=device, generator=gen, dtype=torch.float32)
+        # Verify HIP Graph capture + replay at M >= threshold uses cached bf16x2 weights.
+        x = torch.randn((512, 5120), device=device, generator=gen).to(torch.bfloat16)
+        res = torch.randn((512, 4, 5120), device=device, generator=gen).to(torch.bfloat16)
+        post = torch.rand((512, 4), device=device, generator=gen, dtype=torch.float32)
+        comb = torch.rand((512, 4, 4), device=device, generator=gen, dtype=torch.float32)
+        pre = torch.rand((512, 4), device=device, generator=gen, dtype=torch.float32)
         with patch.dict(
             os.environ, {"SGLANG_HCU_MHC_BOUNDARY_BF16X2": "1"}, clear=False
         ):

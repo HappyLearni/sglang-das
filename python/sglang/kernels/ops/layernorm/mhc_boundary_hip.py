@@ -22,6 +22,9 @@ from sglang.srt.utils.common import get_bool_env_var, is_gfx95_supported, is_hcu
 _is_hip = is_hip()
 _is_hcu = is_hcu()
 _HC_FN_BF16X2_CACHE: dict = {}
+# Measured on Hygon BW1000 (gfx936): below M=512 the extra BF16 weight load
+# makes BF16x2 0.91x-0.99x of FP32 IEEE; at M >= 512 BF16x2 is 1.04x-1.53x faster.
+_HCU_MHC_BOUNDARY_BF16X2_MIN_M = 512
 
 
 def _hcu_hc_boundary_bf16x2_enabled() -> bool:
@@ -1074,6 +1077,7 @@ def _hc_boundary_partials(
     grid_m = triton.cdiv(m, block_m)
     if (
         _hcu_hc_boundary_bf16x2_enabled()
+        and m >= _HCU_MHC_BOUNDARY_BF16X2_MIN_M
         and hc_mult == 4
         and residual.dtype == torch.bfloat16
         and hc_fn.dtype == torch.float32
