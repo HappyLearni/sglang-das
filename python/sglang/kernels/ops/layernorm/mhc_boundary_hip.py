@@ -1,7 +1,9 @@
 """HIP mHC sublayer boundary: hc_post + collapse + mixing statistics, with the
 reduce + sinkhorn launched alone or hosted by the layer's next RMSNorm (HcCoefficients)."""
 
+import threading
 from typing import Optional, Tuple, Union
+import weakref
 
 import torch
 import triton
@@ -21,6 +23,7 @@ from sglang.srt.utils.common import get_bool_env_var, is_gfx95_supported, is_hcu
 
 _is_hip = is_hip()
 _is_hcu = is_hcu()
+_HC_FN_BF16X2_LOCK = threading.Lock()
 _HC_FN_BF16X2_CACHE: dict = {}
 # Measured on Hygon BW1000 (gfx936): below M=512 the extra BF16 weight load
 # makes BF16x2 0.91x-0.99x of FP32 IEEE; at M >= 512 BF16x2 is 1.04x-1.53x faster.
@@ -35,18 +38,69 @@ def _hcu_hc_boundary_bf16x2_enabled() -> bool:
     )
 
 
-def _get_hc_fn_bf16x2(hc_fn: torch.Tensor) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    key = (hc_fn.data_ptr(), hc_fn.shape, hc_fn.stride(), hc_fn.device.index)
-    version = hc_fn._version
-    entry = _HC_FN_BF16X2_CACHE.get(key)
-    if entry is not None and entry[0] == version:
-        return entry[1], entry[2]
-    if hc_fn.is_cuda and torch.cuda.is_current_stream_capturing():
-        return None
+def _split_hc_fn_bf16x2(hc_fn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     w_hi = hc_fn.to(torch.bfloat16).contiguous()
     w_lo = (hc_fn - w_hi.float()).to(torch.bfloat16).contiguous()
-    _HC_FN_BF16X2_CACHE[key] = (version, w_hi, w_lo)
     return w_hi, w_lo
+
+
+def _hc_fn_cache_key(hc_fn: torch.Tensor) -> tuple:
+    return (hc_fn.data_ptr(), hc_fn.shape, hc_fn.stride(), hc_fn.device.index)
+
+
+def refresh_hc_fn_bf16x2_cache(hc_fn: Optional[torch.Tensor] = None) -> None:
+    """Refresh cached BF16x2 split buffers after online weight reload.
+
+    Weight loaders often use ``param.data.copy_()``, which does not bump
+    ``_version``. When ``hc_fn`` is provided and already cached for the same
+    underlying storage, this updates ``(w_hi, w_lo)`` **in place** so any
+    already-captured HIP Graph referencing those buffers immediately sees the
+    new weights without recapturing. Passing ``hc_fn=None`` drops all entries.
+    """
+    with _HC_FN_BF16X2_LOCK:
+        dead_keys = [k for k, v in _HC_FN_BF16X2_CACHE.items() if v[0]() is None]
+        for k in dead_keys:
+            _HC_FN_BF16X2_CACHE.pop(k, None)
+        if hc_fn is None:
+            _HC_FN_BF16X2_CACHE.clear()
+            return
+        key = _hc_fn_cache_key(hc_fn)
+        entry = _HC_FN_BF16X2_CACHE.get(key)
+        if entry is None:
+            return
+        storage_ref, _old_ver, w_hi, w_lo = entry
+        if storage_ref() is hc_fn.untyped_storage():
+            new_hi, new_lo = _split_hc_fn_bf16x2(hc_fn)
+            w_hi.copy_(new_hi)
+            w_lo.copy_(new_lo)
+            _HC_FN_BF16X2_CACHE[key] = (storage_ref, hc_fn._version, w_hi, w_lo)
+        else:
+            _HC_FN_BF16X2_CACHE.pop(key, None)
+
+
+def _get_hc_fn_bf16x2(hc_fn: torch.Tensor) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    key = _hc_fn_cache_key(hc_fn)
+    storage = hc_fn.untyped_storage()
+    version = hc_fn._version
+    entry = _HC_FN_BF16X2_CACHE.get(key)
+    if entry is not None and entry[0]() is storage and entry[1] == version:
+        return entry[2], entry[3]
+    if hc_fn.is_cuda and torch.cuda.is_current_stream_capturing():
+        return None
+    with _HC_FN_BF16X2_LOCK:
+        entry = _HC_FN_BF16X2_CACHE.get(key)
+        if entry is not None and entry[0]() is storage and entry[1] == version:
+            return entry[2], entry[3]
+        new_hi, new_lo = _split_hc_fn_bf16x2(hc_fn)
+        if entry is not None and entry[0]() is storage:
+            # Preserve existing buffer addresses for any captured HIP Graph.
+            w_hi, w_lo = entry[2], entry[3]
+            w_hi.copy_(new_hi)
+            w_lo.copy_(new_lo)
+            _HC_FN_BF16X2_CACHE[key] = (entry[0], version, w_hi, w_lo)
+            return w_hi, w_lo
+        _HC_FN_BF16X2_CACHE[key] = (weakref.ref(storage), version, new_hi, new_lo)
+        return new_hi, new_lo
 # CDNA has no tf32: the mixing dot runs in ieee fp32 (the CUDA kernel uses tf32x3)
 _HC_MIX_DOT_PRECISION = "ieee"
 

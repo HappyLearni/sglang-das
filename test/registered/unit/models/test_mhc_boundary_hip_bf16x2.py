@@ -15,8 +15,8 @@ class TestMhcBoundaryHipBf16x2Cache(unittest.TestCase):
     def tearDown(self):
         mod._HC_FN_BF16X2_CACHE.clear()
 
-    def test_bf16x2_cache_reuses_and_invalidates_on_mutation(self):
-        w = torch.randn((24, 256), dtype=torch.float32) * 0.05
+    def test_bf16x2_cache_reuses_and_refreshes_on_mutation_and_data_copy(self):
+        w = torch.nn.Parameter(torch.randn((24, 256), dtype=torch.float32) * 0.05)
         hi1, lo1 = mod._get_hc_fn_bf16x2(w)
         hi2, lo2 = mod._get_hc_fn_bf16x2(w)
         self.assertIs(hi1, hi2)
@@ -24,10 +24,23 @@ class TestMhcBoundaryHipBf16x2Cache(unittest.TestCase):
         recon = hi1.float() + lo1.float()
         self.assertLess((recon - w).abs().max().item(), 1e-5)
 
-        w.mul_(2.0)
+        # Standard in-place mutation increments _version and updates buffers in place.
+        with torch.no_grad():
+            w.mul_(2.0)
         hi3, lo3 = mod._get_hc_fn_bf16x2(w)
-        self.assertIsNot(hi1, hi3)
+        self.assertIs(hi1, hi3)
         self.assertLess(((hi3.float() + lo3.float()) - w).abs().max().item(), 1e-5)
+
+        # Online weight reload uses param.data.copy_(), which does NOT bump _version.
+        ver_before = w._version
+        new_w = torch.randn((24, 256), dtype=torch.float32) * 0.08
+        w.data.copy_(new_w)
+        self.assertEqual(w._version, ver_before)
+        mod.refresh_hc_fn_bf16x2_cache(w)
+        hi4, lo4 = mod._get_hc_fn_bf16x2(w)
+        self.assertIs(hi1, hi4)
+        self.assertIs(lo1, lo4)
+        self.assertLess(((hi4.float() + lo4.float()) - new_w).abs().max().item(), 1e-5)
 
     def test_env_flag_gates_bf16x2(self):
         with (
@@ -111,6 +124,42 @@ class TestMhcBoundaryHipBf16x2Device(unittest.TestCase):
             self.assertTrue(torch.equal(g_ro, ref_ro))
             self.assertTrue(torch.equal(g_y, ref_y))
             self.assertTrue(torch.equal(g_c.part_mix, ref_c.part_mix))
+
+            # Regression test: online weight reload via param.data.copy_() +
+            # refresh_hc_fn_bf16x2_cache() must update the ALREADY-CAPTURED HIP
+            # Graph's buffers in place with zero recapture.
+            hc_param = torch.nn.Parameter(hc_fn.clone())
+            mod._HC_FN_BF16X2_CACHE.clear()
+            _, _, _ = mod.hc_boundary_fused_deferred(
+                x, res, post, comb, pre, hc_param, hc_scale, hc_base, 4, 20, 1e-6, 1e-6
+            )
+            torch.cuda.synchronize()
+            g_reload = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g_reload):
+                _, _, g_reload_c = mod.hc_boundary_fused_deferred(
+                    x, res, post, comb, pre, hc_param, hc_scale, hc_base, 4, 20, 1e-6, 1e-6
+                )
+            ver_before = hc_param._version
+            new_fn = (
+                torch.randn((24, 20480), device=device, generator=gen, dtype=torch.float32)
+                * 0.03
+            )
+            hc_param.data.copy_(new_fn)
+            self.assertEqual(hc_param._version, ver_before)
+            mod.refresh_hc_fn_bf16x2_cache(hc_param)
+            g_reload.replay()
+            torch.cuda.synchronize()
+
+            with patch.dict(
+                os.environ, {"SGLANG_HCU_MHC_BOUNDARY_BF16X2": "0"}, clear=False
+            ):
+                _, _, new_ref_c = mod.hc_boundary_fused_deferred(
+                    x, res, post, comb, pre, hc_param, hc_scale, hc_base, 4, 20, 1e-6, 1e-6
+                )
+            reload_err = (
+                g_reload_c.part_mix.sum(0) - new_ref_c.part_mix.sum(0)
+            ).abs().max().item()
+            self.assertLess(reload_err, 1e-4, f"post-reload graph mix_err={reload_err}")
 
 
 if __name__ == "__main__":
