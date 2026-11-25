@@ -1,4 +1,5 @@
 import os
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -6,6 +7,24 @@ import torch
 
 from sglang.kernels.ops.layernorm import mhc_boundary_hip as mod
 from sglang.srt.utils import is_hcu, is_hip
+
+
+def _make_direct_weight_updater(model: torch.nn.Module, device: str):
+    from sglang.srt.model_executor.model_runner_components.weight_updater import (
+        WeightUpdater,
+    )
+
+    return WeightUpdater(
+        tp_rank=0,
+        device=device,
+        gpu_id=0,
+        model_config=SimpleNamespace(),
+        custom_weight_loaders={},
+        get_model=lambda: model,
+        update_model_fields=lambda **_: None,
+        recapture_cuda_graph=lambda: None,
+        get_model_runner=lambda: SimpleNamespace(),
+    )
 
 
 class TestMhcBoundaryHipBf16x2Cache(unittest.TestCase):
@@ -41,6 +60,52 @@ class TestMhcBoundaryHipBf16x2Cache(unittest.TestCase):
         self.assertIs(hi1, hi4)
         self.assertIs(lo1, lo4)
         self.assertLess(((hi4.float() + lo4.float()) - new_w).abs().max().item(), 1e-5)
+
+    def test_direct_weight_updater_refreshes_bf16x2_cache_in_place(self):
+        from sglang.srt.model_executor.model_runner_components import (
+            weight_updater as wu_mod,
+        )
+
+        class _TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.hc_attn_fn = torch.nn.Parameter(
+                    torch.randn((24, 256), dtype=torch.float32) * 0.05
+                )
+
+        model = _TinyModel()
+        hi1, lo1 = mod._get_hc_fn_bf16x2(model.hc_attn_fn)
+        ver_before = model.hc_attn_fn._version
+        new_w = torch.randn((24, 256), dtype=torch.float32) * 0.09
+        updater = _make_direct_weight_updater(model, device="cpu")
+
+        with (
+            patch.object(wu_mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)),
+            patch.object(
+                wu_mod,
+                "get_model",
+                return_value=SimpleNamespace(weight_cache_mode="off"),
+            ),
+            patch.object(
+                wu_mod, "_unsupported_derived_weight_cache_error", return_value=None
+            ),
+            patch.object(
+                torch,
+                "get_device_module",
+                return_value=SimpleNamespace(current_device=lambda: torch.device("cpu")),
+            ),
+        ):
+            ok, msg = updater.update_weights_from_tensor(
+                [("hc_attn_fn", new_w)], load_format="direct"
+            )
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(model.hc_attn_fn._version, ver_before)
+        self.assertTrue(torch.equal(model.hc_attn_fn.data, new_w))
+        hi2, lo2 = mod._get_hc_fn_bf16x2(model.hc_attn_fn)
+        self.assertIs(hi1, hi2)
+        self.assertIs(lo1, lo2)
+        self.assertLess(((hi2.float() + lo2.float()) - new_w).abs().max().item(), 1e-5)
 
     def test_env_flag_gates_bf16x2(self):
         with (
@@ -160,6 +225,101 @@ class TestMhcBoundaryHipBf16x2Device(unittest.TestCase):
                 g_reload_c.part_mix.sum(0) - new_ref_c.part_mix.sum(0)
             ).abs().max().item()
             self.assertLess(reload_err, 1e-4, f"post-reload graph mix_err={reload_err}")
+
+    def test_direct_weight_updater_refreshes_eager_and_captured_hip_graph_at_m512(self):
+        from sglang.srt.model_executor.model_runner_components import (
+            weight_updater as wu_mod,
+        )
+
+        device = torch.device("cuda")
+        gen = torch.Generator(device=device).manual_seed(19)
+
+        class _TinyMhcModel(torch.nn.Module):
+            def __init__(self, init_fn: torch.Tensor):
+                super().__init__()
+                self.hc_attn_fn = torch.nn.Parameter(init_fn)
+
+        init_fn = (
+            torch.randn((24, 20480), device=device, generator=gen, dtype=torch.float32)
+            * 0.02
+        )
+        new_fn = (
+            torch.randn((24, 20480), device=device, generator=gen, dtype=torch.float32)
+            * 0.04
+        )
+        model = _TinyMhcModel(init_fn.clone())
+        hc_scale = torch.ones((3,), device=device, dtype=torch.float32)
+        hc_base = torch.zeros((24,), device=device, dtype=torch.float32)
+        x = torch.randn((512, 5120), device=device, generator=gen).to(torch.bfloat16)
+        res = torch.randn((512, 4, 5120), device=device, generator=gen).to(
+            torch.bfloat16
+        )
+        post = torch.rand((512, 4), device=device, generator=gen, dtype=torch.float32)
+        comb = torch.rand(
+            (512, 4, 4), device=device, generator=gen, dtype=torch.float32
+        )
+        pre = torch.rand((512, 4), device=device, generator=gen, dtype=torch.float32)
+
+        with patch.dict(
+            os.environ, {"SGLANG_HCU_MHC_BOUNDARY_BF16X2": "1"}, clear=False
+        ):
+            _, _, pre_eager_c = mod.hc_boundary_fused_deferred(
+                x, res, post, comb, pre, model.hc_attn_fn, hc_scale, hc_base, 4, 20, 1e-6, 1e-6
+            )
+            pre_mix = pre_eager_c.part_mix.sum(0).clone()
+            torch.cuda.synchronize()
+
+            g_direct = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g_direct):
+                _, _, g_direct_c = mod.hc_boundary_fused_deferred(
+                    x, res, post, comb, pre, model.hc_attn_fn, hc_scale, hc_base, 4, 20, 1e-6, 1e-6
+                )
+            torch.cuda.synchronize()
+
+            updater = _make_direct_weight_updater(model, device="cuda")
+            ver_before = model.hc_attn_fn._version
+            with (
+                patch.object(
+                    wu_mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
+                ),
+                patch.object(
+                    wu_mod,
+                    "get_model",
+                    return_value=SimpleNamespace(weight_cache_mode="off"),
+                ),
+                patch.object(
+                    wu_mod,
+                    "_unsupported_derived_weight_cache_error",
+                    return_value=None,
+                ),
+            ):
+                ok, msg = updater.update_weights_from_tensor(
+                    [("hc_attn_fn", new_fn)], load_format="direct"
+                )
+            self.assertTrue(ok, msg)
+            self.assertEqual(model.hc_attn_fn._version, ver_before)
+            self.assertTrue(torch.equal(model.hc_attn_fn.data, new_fn))
+
+            # Both eager and already-captured HIP Graph replay must reflect new_fn.
+            _, _, post_eager_c = mod.hc_boundary_fused_deferred(
+                x, res, post, comb, pre, model.hc_attn_fn, hc_scale, hc_base, 4, 20, 1e-6, 1e-6
+            )
+            g_direct.replay()
+            torch.cuda.synchronize()
+            eager_mix = post_eager_c.part_mix.sum(0).clone()
+            graph_mix = g_direct_c.part_mix.sum(0).clone()
+
+        with patch.dict(
+            os.environ, {"SGLANG_HCU_MHC_BOUNDARY_BF16X2": "0"}, clear=False
+        ):
+            _, _, ref_new_c = mod.hc_boundary_fused_deferred(
+                x, res, post, comb, pre, model.hc_attn_fn, hc_scale, hc_base, 4, 20, 1e-6, 1e-6
+            )
+            ref_new_mix = ref_new_c.part_mix.sum(0)
+
+        self.assertGreater((ref_new_mix - pre_mix).abs().max().item(), 1e-2)
+        self.assertLess((eager_mix - ref_new_mix).abs().max().item(), 1e-4)
+        self.assertLess((graph_mix - ref_new_mix).abs().max().item(), 1e-4)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,13 @@ def _hc_fn_cache_key(hc_fn: torch.Tensor) -> tuple:
     return (hc_fn.data_ptr(), hc_fn.shape, hc_fn.stride(), hc_fn.device.index)
 
 
+def _same_storage(storage_ref, storage) -> bool:
+    cached = storage_ref()
+    return cached is not None and (
+        cached is storage or cached._cdata == storage._cdata
+    )
+
+
 def refresh_hc_fn_bf16x2_cache(hc_fn: Optional[torch.Tensor] = None) -> None:
     """Refresh cached BF16x2 split buffers after online weight reload.
 
@@ -69,7 +76,7 @@ def refresh_hc_fn_bf16x2_cache(hc_fn: Optional[torch.Tensor] = None) -> None:
         if entry is None:
             return
         storage_ref, _old_ver, w_hi, w_lo = entry
-        if storage_ref() is hc_fn.untyped_storage():
+        if _same_storage(storage_ref, hc_fn.untyped_storage()):
             new_hi, new_lo = _split_hc_fn_bf16x2(hc_fn)
             w_hi.copy_(new_hi)
             w_lo.copy_(new_lo)
@@ -83,16 +90,16 @@ def _get_hc_fn_bf16x2(hc_fn: torch.Tensor) -> Optional[Tuple[torch.Tensor, torch
     storage = hc_fn.untyped_storage()
     version = hc_fn._version
     entry = _HC_FN_BF16X2_CACHE.get(key)
-    if entry is not None and entry[0]() is storage and entry[1] == version:
+    if entry is not None and _same_storage(entry[0], storage) and entry[1] == version:
         return entry[2], entry[3]
     if hc_fn.is_cuda and torch.cuda.is_current_stream_capturing():
         return None
     with _HC_FN_BF16X2_LOCK:
         entry = _HC_FN_BF16X2_CACHE.get(key)
-        if entry is not None and entry[0]() is storage and entry[1] == version:
+        if entry is not None and _same_storage(entry[0], storage) and entry[1] == version:
             return entry[2], entry[3]
         new_hi, new_lo = _split_hc_fn_bf16x2(hc_fn)
-        if entry is not None and entry[0]() is storage:
+        if entry is not None and _same_storage(entry[0], storage):
             # Preserve existing buffer addresses for any captured HIP Graph.
             w_hi, w_lo = entry[2], entry[3]
             w_hi.copy_(new_hi)

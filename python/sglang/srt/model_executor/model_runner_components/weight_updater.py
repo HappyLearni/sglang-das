@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
@@ -380,6 +381,7 @@ class WeightUpdater:
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
             custom_loader(self.get_model(), named_tensors)
+            _refresh_mhc_boundary_bf16x2_cache(self.get_model().parameters())
         elif load_format is None:
             self.get_model().load_weights(named_tensors)
         else:
@@ -441,10 +443,27 @@ class WeightUpdater:
             return False, str(e)
 
 
+def _refresh_mhc_boundary_bf16x2_cache(params) -> None:
+    """In-place refresh any cached HCU mHC BF16x2 weight splits after direct writes.
+
+    ``default_weight_loader`` copies via ``param.data.copy_()``, bypassing custom
+    ``weight_loader`` hooks and without bumping ``_version``. Checking the
+    already-imported module avoids importing Triton on unrelated paths.
+    """
+    mod = sys.modules.get("sglang.kernels.ops.layernorm.mhc_boundary_hip")
+    if mod is None or not mod._HC_FN_BF16X2_CACHE:
+        return
+    refresh = mod.refresh_hc_fn_bf16x2_cache
+    for param in params:
+        refresh(param)
+
+
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
     for name, tensor in named_tensors:
-        default_weight_loader(params_dict[name], tensor)
+        param = params_dict[name]
+        default_weight_loader(param, tensor)
+        _refresh_mhc_boundary_bf16x2_cache((param,))
 
 
 def _unwrap_tensor(tensor, tp_rank, device):
