@@ -12824,10 +12824,12 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
             override_dspark.restore()
         cache.sanity_check()
 
-        # Encoder replay: target-only caches have no SWA tree component (FULL-only),
-        # while draft-assisted caches keep SWA non-gating (swa_gates_prefix_match=False).
-        # In both layouts encoder replay populates RequestWindow, so the tree
-        # preserves the FULL prefix match for prompt-logprob readers.
+        # Encoder replay tree-matching contract: target-only caches have no SWA
+        # tree component (FULL-only), while draft-assisted caches keep SWA
+        # non-gating (swa_gates_prefix_match=False). In both layouts the radix
+        # tree retains the FULL prefix match for prompt-logprob readers instead
+        # of applying the paged-SWA hold-back; SWA initialization is delegated
+        # to encoder SWA replay in RequestWindow (see test_encoder_swa_replay).
         for label, enc_cfg in (
             (
                 "full_only_tree",
@@ -12930,7 +12932,9 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
 
         # Chunk 2 [256..512): after advancing to 512, Page 0 [0..256) is outside
         # the active window [384..512) and may publish/dedup, while Page 1
-        # [256..512) stays private.
+        # [256..512) stays private. Because private Page 1 already covers the
+        # entire active window, Page 0's obsolete SWA lock is skipped so SWA
+        # stays evictable (preventing lone-chunked-request deadlock).
         chunk2_slots = self._alloc_paged(allocator, 256)
         self.assertIsNotNone(chunk2_slots)
         pool.write((consumer.kv.req_pool_idx, slice(256, 512)), chunk2_slots)
@@ -12940,6 +12944,8 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         checkpoint_kv_cache(consumer, cache)
         self.assertEqual(consumer.prefix_len, 512)
         self.assertEqual(consumer.kv.cache_protected_len, 256)
+        self.assertGreaterEqual(cache.swa_evictable_size(), 256)
+        self.assertTrue(consumer.lock.swa_released)
         torch.testing.assert_close(
             pool.req_to_token[consumer.kv.req_pool_idx, :256].to(torch.int64),
             canonical_p0.to(torch.int64),
@@ -13010,8 +13016,12 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
 
         checkpoint_kv_cache(consumer, cache)
         # Active window [392..520) overlaps Page 1 [256..512), so Page 1 stays
-        # private instead of deduping onto canonical_p1.
+        # private instead of deduping onto canonical_p1. Because the private
+        # tail [256..520) already spans the full active SWA window, Page 0's
+        # obsolete tree SWA lock is also released so SWA stays evictable.
         self.assertEqual(consumer.kv.cache_protected_len, 256)
+        self.assertTrue(consumer.lock.swa_released)
+        self.assertGreaterEqual(cache.swa_evictable_size(), 256)
         row_p1 = pool.req_to_token[consumer.kv.req_pool_idx, 256:512].to(torch.int64)
         self.assertFalse(torch.equal(row_p1, canonical_p1.to(torch.int64)))
         torch.testing.assert_close(row_p1, private_tail[:256].to(torch.int64))
@@ -13252,7 +13262,9 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
                 full_req, [full_req], empty_running
             )
         )
-        self.assertFalse(
+        # Running FULL decode does not block admission (avoiding starvation);
+        # separation from running_batch is enforced by the mixing predicate.
+        self.assertTrue(
             sched._can_share_bounded_replay_hidden_mode(ordinary, [], full_running)
         )
 
@@ -13277,6 +13289,388 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         lp_req.init_next_round_input(cache)
         self.assertIsNone(sched._prefetch_kvcache(lp_req))
         cache.prefetch_from_storage.assert_not_called()
+
+        # Under LMCache, a rank whose local L1 hit already equals match_end > 0
+        # must still enter prefetch_from_storage so all TP ranks join the MIN
+        # all-reduce together, whereas match_end == 0 skips on all ranks.
+        sched.enable_hicache_storage = False
+        sched.enable_lmcache = True
+        ordinary_hit = Req(
+            rid="lmcache-rank0",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        ordinary_hit.refresh_fill_ids()
+        ordinary_hit.init_next_round_input = Mock()
+        ordinary_hit.prefix_len = 504
+        ordinary_hit.host_hit_length = 0
+        ordinary_hit.last_node = cache.root_node_handle()
+        ordinary_hit.last_host_node = cache.root_node_handle()
+        sched._prefetch_kvcache(ordinary_hit)
+        cache.prefetch_from_storage.assert_called_once()
+        cache.prefetch_from_storage.reset_mock()
+        sched._prefetch_kvcache(lp_req)
+        cache.prefetch_from_storage.assert_not_called()
+
+    def test_pd_prefill_checkpoint_does_not_recycle_queued_private_pages(self):
+        """When PD prefill has already queued private pages for async transfer
+        (start_send_idx > cache_protected_len), a later live checkpoint must
+        not deduplicate and free those pages until is_finished=True."""
+        from types import SimpleNamespace
+
+        cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            page_size=256,
+            sliding_window_size=128,
+            kv_size=2048,
+            max_context_len=1024,
+            decoder_swa_bounded_replay=True,
+            swa_gates_prefix_match=True,
+        )
+        cache, allocator, pool = build_fixture(cfg)
+        prompt = list(range(1, 633))
+        canonical_p0 = self._alloc_paged(allocator, 256)
+        self.assertIsNotNone(canonical_p0)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", prompt[:256])),
+                value=canonical_p0.clone(),
+            )
+        )
+
+        req = Req(
+            rid="pd-chunked-sender",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            return_logprob=True,
+        )
+        req.logprob_start_len = 256
+        req.init_next_round_input(cache)
+        req.lock = cache.lock(req.last_node)
+        self.assertIsNotNone(pool.alloc([req]))
+
+        # Chunk 1 [0..256): kept private at checkpoint, then queued for Mooncake.
+        p0_private = self._alloc_paged(allocator, 256)
+        self.assertIsNotNone(p0_private)
+        pool.write((req.kv.req_pool_idx, slice(0, 256)), p0_private)
+        req.kv.kv_allocated_len = 256
+        req.kv.kv_committed_len = 256
+        req.extend_end = 256
+        req.disagg_kv_sender = SimpleNamespace()
+        checkpoint_kv_cache(req, cache)
+        req.start_send_idx = 256
+
+        # Chunk 2 [256..512): because start_send_idx=256 > cache_protected_len=0,
+        # p0_private must stay owned by req (not deduped/freed back to allocator).
+        p1_private = self._alloc_paged(allocator, 256)
+        self.assertIsNotNone(p1_private)
+        pool.write((req.kv.req_pool_idx, slice(256, 512)), p1_private)
+        req.kv.kv_allocated_len = 512
+        req.kv.kv_committed_len = 512
+        req.extend_end = 512
+        free_full_before = allocator.full_available_size()
+        checkpoint_kv_cache(req, cache)
+        self.assertEqual(req.kv.cache_protected_len, 0)
+        self.assertEqual(allocator.full_available_size(), free_full_before)
+        torch.testing.assert_close(
+            pool.req_to_token[req.kv.req_pool_idx, :256].to(torch.int64),
+            p0_private.to(torch.int64),
+        )
+
+        # Once transfer completes (is_finished=True), release_kv_cache publishes
+        # and frees cleanly with zero leaks.
+        p2_private = self._alloc_paged(allocator, 120)
+        self.assertIsNotNone(p2_private)
+        pool.write((req.kv.req_pool_idx, slice(512, 632)), p2_private)
+        req.kv.kv_allocated_len = 632
+        req.kv.kv_committed_len = 632
+        req.extend_end = 632
+        req.finished_reason = FINISH_LENGTH(length=0)
+        release_kv_cache(req, cache, checkpoint=True)
+        cache.sanity_check()
+
+    def test_dsv4_decode_donation_preserves_active_swa_and_avoids_leak_on_overlap(
+        self,
+    ):
+        """DSV4 decode prompt donation must never overwrite a live decoder's
+        active SWA window or leak private SWA slots on duplicate donors."""
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
+        )
+
+        cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            page_size=256,
+            sliding_window_size=128,
+            kv_size=2048,
+            max_context_len=1024,
+            decoder_swa_bounded_replay=True,
+            swa_gates_prefix_match=True,
+        )
+        cache, allocator, pool = build_fixture(cfg)
+        processor = SimpleNamespace(
+            tree_cache=cache,
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=allocator,
+            model_config=SimpleNamespace(sliding_window_size=128),
+        )
+
+        # Case 1: 300-token prompt where Page 0 [0..256) overlaps active window
+        # [172..300) -> donation must skip Page 0, preserving live SWA mapping.
+        short_prompt = list(range(1, 301))
+        donor_p0 = self._alloc_paged(allocator, 256)
+        self.assertIsNotNone(donor_p0)
+        allocator.free_swa_segment(donor_p0, start_pos=0)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", short_prompt[:256])),
+                value=donor_p0.clone(),
+                component_evicted_seqlens={ComponentType.SWA: 256},
+                force_leaf_creation=True,
+            )
+        )
+        req_short = Req(
+            rid="decode-donor-300",
+            origin_input_text="",
+            origin_input_ids=array("q", short_prompt),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=4),
+        )
+        req_short.init_next_round_input(cache)
+        req_short.lock = cache.lock(req_short.last_node)
+        self.assertIsNotNone(pool.alloc([req_short]))
+        short_slots = self._alloc_paged(allocator, 300)
+        self.assertIsNotNone(short_slots)
+        pool.write((req_short.kv.req_pool_idx, slice(0, 300)), short_slots)
+        req_short.kv.kv_allocated_len = 300
+        req_short.kv.kv_committed_len = 300
+        req_short.extend_end = 300
+        req_short.dsv4_decode_radix_cache_prompt_once = True
+        req_short.dsv4_decode_radix_cache_prompt_len = 300
+        SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(
+            processor, req_short
+        )
+        self.assertEqual(req_short.kv.cache_protected_len, 0)
+        # Active window [172..256) keeps its non-zero full_to_swa mapping.
+        mapped = allocator.full_to_swa_index_mapping[
+            pool.req_to_token[req_short.kv.req_pool_idx, 172:256].to(torch.int64)
+        ]
+        self.assertTrue(bool((mapped > 0).all()))
+        req_short.finished_reason = FINISH_LENGTH(length=0)
+        release_kv_cache(req_short, cache, checkpoint=False)
+        cache.sanity_check()
+
+        # Case 2: 640-token duplicate donor -> Pages 0-1 [0..512) are strictly
+        # before active window [512..640); private SWA under [0..512) is freed
+        # before dedup so zero SWA slots leak and [512..640) stays intact.
+        long_prompt = list(range(2001, 2641))
+        for idx in range(2):
+            req_long = Req(
+                rid=f"decode-donor-640-{idx}",
+                origin_input_text="",
+                origin_input_ids=array("q", long_prompt),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=4),
+            )
+            req_long.refresh_fill_ids()
+            req_long.lock = cache.lock(cache.root_node_handle())
+            self.assertIsNotNone(pool.alloc([req_long]))
+            slots = self._alloc_paged(allocator, 640)
+            self.assertIsNotNone(slots)
+            pool.write((req_long.kv.req_pool_idx, slice(0, 640)), slots)
+            req_long.kv.kv_allocated_len = 640
+            req_long.kv.kv_committed_len = 640
+            req_long.extend_end = 640
+            req_long.dsv4_decode_radix_cache_prompt_once = True
+            req_long.dsv4_decode_radix_cache_prompt_len = 640
+            SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(
+                processor, req_long
+            )
+            self.assertEqual(req_long.kv.cache_protected_len, 512)
+            active_mapped = allocator.full_to_swa_index_mapping[
+                pool.req_to_token[req_long.kv.req_pool_idx, 512:640].to(torch.int64)
+            ]
+            self.assertTrue(bool((active_mapped > 0).all()))
+            req_long.finished_reason = FINISH_LENGTH(length=0)
+            release_kv_cache(req_long, cache, checkpoint=False)
+            cache.sanity_check()
+
+    def test_short_first_chunk_after_prefix_hit_and_embed_overrides(self):
+        """Under bounded replay with gating paged SWA, PrefillAdder refuses a
+        first chunk shorter than sliding_window_size after a prefix hit, and
+        effective_max_prefix_len honors positional_embed_overrides == zero."""
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+        from sglang.srt.mem_cache.common import effective_max_prefix_len
+
+        cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            page_size=256,
+            sliding_window_size=128,
+            kv_size=2048,
+            max_context_len=1024,
+            decoder_swa_bounded_replay=True,
+            swa_gates_prefix_match=True,
+        )
+        cache, _, _ = build_fixture(cfg)
+        prompt = list(range(1, 401))
+
+        # Positional embed overrides must cap effective_max_prefix_len to 0.
+        override_req = Req(
+            rid="embed-override",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        override_req.positional_embed_overrides = SimpleNamespace(
+            positions=[0], embeds=torch.zeros((1, 4))
+        )
+        self.assertEqual(effective_max_prefix_len(override_req, cache, len(prompt)), 0)
+
+        # Short first chunk (64 < 128) after a 256-token prefix hit must defer.
+        req = Req(
+            rid="short-chunk-after-hit",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.refresh_fill_ids()
+        req.prefix_len = 256
+        adder = PrefillAdder.__new__(PrefillAdder)
+        adder.tree_cache = cache
+        adder.page_size = 256
+        adder.dllm_config = None
+        adder.exact_chunk_fill = True
+        adder.rem_input_tokens = 4096
+        adder.rem_chunk_tokens = 64
+        adder.can_run_list = [SimpleNamespace()]
+        adder._replay_len = lambda r, p: 0
+        adder._check_prefill_tile_budget = lambda t: None
+        adder.memory_budget = SimpleNamespace(
+            check_prefill=lambda **kwargs: (True, kwargs["chunk_limit"])
+        )
+        res = adder._select_prefill_admission(
+            req,
+            total_tokens=200,
+            host_hit_length=0,
+            swa_host_hit_length=0,
+            truncation_align_size=None,
+            has_chunked_req=False,
+        )
+        self.assertEqual(res, AddReqResult.OTHER)
+
+        # Once a full window (128) fits in rem_chunk_tokens, admission succeeds.
+        adder.rem_chunk_tokens = 128
+        res_ok = adder._select_prefill_admission(
+            req,
+            total_tokens=200,
+            host_hit_length=0,
+            swa_host_hit_length=0,
+            truncation_align_size=None,
+            has_chunked_req=False,
+        )
+        self.assertEqual(res_ok.extend_len, 128)
+        self.assertTrue(res_ok.is_chunked)
+
+    def test_eagle_pd_receiver_bigram_cap_and_mamba_checkpoint_preservation(self):
+        """EAGLE PD receiver matches a full page when capped at 256 logical
+        positions (257 raw tokens), and Mamba hybrids never truncate checkpoint
+        keys under decoder_swa_bounded_replay."""
+        from sglang.srt.disaggregation.decode import DecodePreallocQueue
+        from sglang.srt.mem_cache.common import match_kv_cache
+
+        # 1) EAGLE PD receiver: cap=256 logical KV positions must match Page 0
+        # (256 bigrams) rather than truncating to 255 bigrams -> 0.
+        eagle_cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            page_size=256,
+            sliding_window_size=128,
+            kv_size=1024,
+            max_context_len=1024,
+            is_eagle=True,
+            decoder_swa_bounded_replay=True,
+            swa_gates_prefix_match=True,
+        )
+        eagle_cache, eagle_alloc, _ = build_fixture(eagle_cfg)
+        prompt = list(range(1, 385))  # 384 tokens -> boundary cap 384 - 128 = 256
+        slots = self._alloc_paged(eagle_alloc, 512)
+        self.assertIsNotNone(slots)
+        eagle_alloc.free_swa_segment(slots[:256], start_pos=0)
+        eagle_cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", prompt[:257]), is_bigram=True),
+                value=slots[:256].clone(),
+                component_evicted_seqlens={ComponentType.SWA: 256},
+                force_leaf_creation=True,
+            )
+        )
+        eagle_req = Req(
+            rid="eagle-pd-receiver",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        match_kv_cache(
+            eagle_req,
+            eagle_cache,
+            eagle_req.origin_input_ids,
+            max_prefix_len=257,
+            return_full_match=True,
+        )
+        self.assertEqual(eagle_req.prefix_len, 256)
+
+        # Verify DecodePreallocQueue._match_prefix_and_lock expands cap 256 -> 257.
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.tree_cache = eagle_cache
+        queue._uses_swa_tail_prealloc = lambda: True
+        queue._pre_alloc_fill_len = lambda r: 384
+        queue._swa_tail_len = lambda n: 128
+        queue._uses_dsv4_decode_radix_cache = lambda: True
+        queue._build_decode_prefix_match = lambda r, result, max_prefix_len=None: (
+            result.device_prefix_len,
+            max_prefix_len,
+        )
+        matched_len, logical_cap = queue._match_prefix_and_lock(eagle_req)
+        self.assertEqual((matched_len, logical_cap), (256, 256))
+        eagle_cache.unlock(eagle_req.lock)
+        eagle_cache.sanity_check()
+
+        # 2) Mamba hybrid: checkpoint_into_tree must preserve the exact checkpoint
+        # depth instead of truncating the key when is_mamba_enabled=True.
+        cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            page_size=256,
+            sliding_window_size=128,
+            kv_size=2048,
+            max_context_len=1024,
+            decoder_swa_bounded_replay=True,
+            swa_gates_prefix_match=True,
+        )
+        cache, allocator, pool = build_fixture(cfg)
+        cache.is_mamba_enabled = True
+        mreq = Req(
+            rid="mamba-hybrid-checkpoint",
+            origin_input_text="",
+            origin_input_ids=array("q", list(range(1, 513))),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=4),
+        )
+        mreq.refresh_fill_ids()
+        mreq.lock = cache.lock(cache.root_node_handle())
+        self.assertIsNotNone(pool.alloc([mreq]))
+        m_slots = self._alloc_paged(allocator, 512)
+        self.assertIsNotNone(m_slots)
+        pool.write((mreq.kv.req_pool_idx, slice(0, 512)), m_slots)
+        mreq.kv.kv_allocated_len = 512
+        mreq.kv.kv_committed_len = 512
+        mreq.extend_end = 512
+        checkpoint_kv_cache(mreq, cache)
+        self.assertEqual(mreq.kv.cache_protected_len, 512)
+        mreq.finished_reason = FINISH_LENGTH(length=0)
+        release_kv_cache(mreq, cache, checkpoint=False)
+        cache.sanity_check()
 
 
 if __name__ == "__main__":

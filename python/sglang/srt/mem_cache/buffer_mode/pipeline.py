@@ -1468,12 +1468,17 @@ class BufferModePipeline:
                 self._clear_storage_hit(req)
             return True
         joint_len = req.prefix_len
-        fill_ids = getattr(req, "full_untruncated_fill_ids", None) or getattr(
-            req, "origin_input_ids", None
-        )
-        if fill_ids is not None and hasattr(req, "_compute_max_prefix_len"):
+        fill_ids = getattr(req, "full_untruncated_fill_ids", None)
+        if not isinstance(fill_ids, (list, tuple, array)):
+            fill_ids = getattr(req, "origin_input_ids", None)
+        if isinstance(fill_ids, (list, tuple, array)) and hasattr(
+            req, "_compute_max_prefix_len"
+        ):
             max_prefix = effective_max_prefix_len(req, self._cache, len(fill_ids))
-            if f.matched_len + f.num_tokens > max_prefix:
+            if (
+                isinstance(max_prefix, int)
+                and f.matched_len + f.num_tokens > max_prefix
+            ):
                 # The staged span exceeds this request's allowed prefix cap (e.g.
                 # decoder SWA bounded-replay hold-back); drop it instead of
                 # promoting req.prefix_len past the cap.

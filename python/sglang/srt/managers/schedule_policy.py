@@ -1524,6 +1524,25 @@ class PrefillAdder:
         # This verdict controls the next candidate, not the committed request.
         return self.budget_state()
 
+    def _min_bounded_replay_chunk_tokens(self, req: Req) -> int:
+        """Minimum extend chunk length after a prefix hit under decoder SWA
+        bounded replay with gating paged SWA so late layers never read into
+        unverified cached prefix rows."""
+        if not getattr(self.tree_cache, "decoder_swa_bounded_replay", False):
+            return 0
+        components = getattr(self.tree_cache, "components", None)
+        swa = components.get(ComponentType.SWA) if components else None
+        if (
+            swa is None
+            or not swa.sliding_window_size
+            or not getattr(swa, "gates_prefix_match", True)
+        ):
+            return 0
+        session = getattr(self.tree_cache, "session", None)
+        if session is not None and session.will_lend_record(req):
+            return 0
+        return int(swa.sliding_window_size)
+
     def _select_prefill_admission(
         self,
         req: Req,
@@ -1606,6 +1625,17 @@ class PrefillAdder:
                 extend_len = end - prefix_len
             if extend_len <= 0:
                 return AddReqResult.OTHER
+            if prefix_len > 0:
+                min_replay_chunk = self._min_bounded_replay_chunk_tokens(req)
+                if min_replay_chunk and extend_len < min_replay_chunk:
+                    # A chunk shorter than the sliding window after a cached
+                    # prefix makes late layers read below prefix_len into
+                    # unverified late-layer SWA rows; wait for a full window.
+                    return (
+                        AddReqResult.OTHER
+                        if self.can_run_list
+                        else AddReqResult.NO_TOKEN
+                    )
             is_chunked = True
             max_new_tokens = 0
             tile_tokens = extend_len

@@ -167,9 +167,10 @@ def _build_server_args(
         limit_mm_data_per_request=get_mm().limit_mm_data_per_request or {},
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=(
-            sa.enable_return_hidden_states and sa.return_hidden_states_mode != "last"
+            sa.enable_return_hidden_states
+            and getattr(sa, "return_hidden_states_mode", None) != "last"
         ),
-        return_hidden_states_mode=sa.return_hidden_states_mode,
+        return_hidden_states_mode=getattr(sa, "return_hidden_states_mode", None),
         # Not a `server_args` field: `TokenizerManager` derives it, and the
         # rust ingress needs the same number for its total-token check.
         num_reserved_tokens=compute_num_reserved_tokens(),

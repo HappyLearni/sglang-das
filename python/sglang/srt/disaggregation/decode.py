@@ -1092,6 +1092,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self._uses_swa_tail_prealloc():
             fill_len = self._pre_alloc_fill_len(req)
             max_prefix_len = fill_len - self._swa_tail_len(fill_len)
+        match_max_prefix_len = max_prefix_len
+        if (
+            match_max_prefix_len is not None
+            and match_max_prefix_len > 0
+            and getattr(getattr(self.tree_cache, "tree_core", None), "is_eagle", False)
+        ):
+            # EAGLE keys are bigrams: matching N bigrams requires N + 1 raw tokens.
+            match_max_prefix_len = min(
+                len(req.origin_input_ids), match_max_prefix_len + 1
+            )
         # Match and lock only reusable FULL KV. The entire SWA tail must be
         # freshly allocated, including when the prefix comes from L2/L3.
         result = match_kv_cache(
@@ -1100,7 +1110,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.origin_input_ids,
             cow_mamba=self.tree_cache.supports_mamba(),
             return_full_match=self._uses_dsv4_decode_radix_cache(),
-            max_prefix_len=max_prefix_len,
+            max_prefix_len=match_max_prefix_len,
         )
         req.lock = self.tree_cache.lock(result.last_device_node)
         return self._build_decode_prefix_match(

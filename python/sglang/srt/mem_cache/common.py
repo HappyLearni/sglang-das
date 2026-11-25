@@ -213,9 +213,16 @@ def _swa_prefix_match_limit(
 ) -> Optional[int]:
     limit_fn = getattr(tree_cache, "swa_prefix_match_limit", None)
     if limit_fn is not None:
-        return limit_fn(req, input_len=input_len, return_full_match=return_full_match)
+        limit = limit_fn(req, input_len=input_len, return_full_match=return_full_match)
+        return limit if isinstance(limit, int) and not isinstance(limit, bool) else None
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens(req)
-    return max(0, input_len - reprefill_tail) if reprefill_tail else None
+    if (
+        not isinstance(reprefill_tail, int)
+        or isinstance(reprefill_tail, bool)
+        or reprefill_tail <= 0
+    ):
+        return None
+    return max(0, input_len - reprefill_tail)
 
 
 def effective_max_prefix_len(
@@ -227,13 +234,15 @@ def effective_max_prefix_len(
     return_full_match: bool = False,
 ) -> int:
     """Maximum prefix length ``req`` may reuse from ``tree_cache`` or storage."""
+    if getattr(req, "positional_embed_overrides", None) is not None:
+        return 0
     limit = req._compute_max_prefix_len(input_len)
     if max_prefix_len is not None:
         limit = min(limit, max_prefix_len)
     swa_limit = _swa_prefix_match_limit(
         tree_cache, req, input_len, return_full_match=return_full_match
     )
-    if swa_limit is not None:
+    if isinstance(swa_limit, int) and not isinstance(swa_limit, bool):
         limit = min(limit, swa_limit)
     return max(limit, 0)
 

@@ -30,7 +30,6 @@ from sglang.srt.managers.schedule_batch import (
     mamba_lazy_spec_in_window,
 )
 from sglang.srt.mem_cache.common import (
-    free_swa_out_of_window_slots,
     checkpoint_kv_cache,
     release_kv_cache,
 )
@@ -223,54 +222,61 @@ class SchedulerBatchResultProcessor:
         old_cache_protected_len = req.kv.cache_protected_len
         old_swa_evicted_seqlen = req.kv.get_evicted_seqlen(ComponentType.SWA)
         old_force_leaf_creation = getattr(req, "force_radix_leaf_creation", False)
+        window_size = int(getattr(self.model_config, "sliding_window_size", 0) or 0)
 
-        # DSV4 prompt donation only needs a full-attention radix leaf. Mark the
-        # whole donated key as SWA-evicted so the SWA component stays tombstoned,
-        # but force full leaf creation so later matches can reuse the full prefix.
-        # Do not pre-protect the whole radix key here: when the prefix already
-        # exists, the generic overlap path must free this request's duplicate
-        # prompt pages and repoint it to the existing radix leaf.
-        req.kv.set_evicted_seqlen(ComponentType.SWA, radix_key_len)
+        # Only donate pages strictly before the live decoder's active SWA window
+        # [prompt_len - window_size, prompt_len). On paged SWA, checkpoint
+        # deduplication rewrites req_to_token to an earlier donor's FULL-only
+        # page whose full_to_swa mapping may already be cleared; donating a page
+        # that overlaps the active window would zero the decoder's live SWA
+        # mapping and orphan its private SWA slots.
+        safe_donate_len = (
+            (max(0, prompt_len - window_size) // page_size) * page_size
+            if window_size > 0
+            else radix_key_len
+        )
+        donate_len = min(radix_key_len, safe_donate_len)
+        if donate_len <= old_cache_protected_len or getattr(
+            self.tree_cache, "disable", False
+        ):
+            req.allow_radix_cache_insert_once = False
+            return
+
+        # Free this request's out-of-window private SWA under [0, donate_len)
+        # BEFORE checkpoint deduplication rewrites req_to_token, so overlapping
+        # donors never leak their private SWA slots and the donated leaf stays
+        # FULL-only (SWA tombstoned).
+        swa_free_start = max(old_cache_protected_len, old_swa_evicted_seqlen)
+        if swa_free_start < donate_len and hasattr(
+            self.token_to_kv_pool_allocator, "free_swa_segment"
+        ):
+            free_slots = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, swa_free_start:donate_len
+            ]
+            self.token_to_kv_pool_allocator.free_swa_segment(
+                free_slots, start_pos=swa_free_start
+            )
+            req.kv.set_evicted_seqlen(ComponentType.SWA, donate_len)
+        else:
+            req.kv.set_evicted_seqlen(
+                ComponentType.SWA, max(old_swa_evicted_seqlen, donate_len)
+            )
+
+        donate_up_to = min(len(prompt_fill_ids), donate_len + int(is_eagle))
         req.force_radix_leaf_creation = True
         try:
-            checkpoint_kv_cache(req, self.tree_cache)
-            # The donated leaf is full-only, so this request's SWA tail is
-            # private and looks free to release outright. It is not: the request
-            # keeps decoding and its sliding window still reaches back into the
-            # donated range, so an untracked free hands live slots to another
-            # request (silent wrong tokens) while leaving the rest unaccounted
-            # for (pool leak). Use the tracked window-aware helper, which stops
-            # at max(window, page) and records swa_evicted_seqlen so the
-            # end-of-request path releases the remainder.
-            window_size = int(
-                getattr(self.model_config, "sliding_window_size", 0) or 0
-            )
-            if window_size > 0 and prompt_len > 0:
-                free_swa_out_of_window_slots(
-                    req,
-                    prompt_len - 1,
-                    sliding_window_size=window_size,
-                    page_size=page_size,
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    retain_floor=self.tree_cache.swa_retain_floor(req),
-                )
-            # The tree keeps the donated full pages but tombstones their SWA,
-            # so no owner remains for the SWA under [0, radix_key_len). Hand the
-            # range to release_kv_cache, which runs after the last decode step.
-            req.dsv4_donated_swa_len = max(
-                int(getattr(req, "dsv4_donated_swa_len", 0) or 0), radix_key_len
-            )
+            req.allow_radix_cache_insert_once = False
+            self.tree_cache.checkpoint(req, up_to=donate_up_to)
+            req.prefix_len = req.extend_end
             if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
                 logger.info(
                     "DSV4 decode radix prompt inserted: rid=%s "
-                    "prompt_len=%d radix_key_len=%d",
+                    "prompt_len=%d donate_len=%d",
                     req.rid,
                     prompt_len,
-                    radix_key_len,
+                    donate_len,
                 )
         finally:
-            req.kv.set_evicted_seqlen(ComponentType.SWA, old_swa_evicted_seqlen)
             req.force_radix_leaf_creation = old_force_leaf_creation
             if req.kv.cache_protected_len < old_cache_protected_len:
                 req.kv.cache_protected_len = old_cache_protected_len

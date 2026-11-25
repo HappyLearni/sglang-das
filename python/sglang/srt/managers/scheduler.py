@@ -4086,7 +4086,12 @@ class Scheduler(
                 match_end = effective_max_prefix_len(
                     req, tree_cache, len(req.full_untruncated_fill_ids)
                 )
-                if match_end <= matched_len:
+                # LMCache reconciles unequal TP-rank local L1 hits via a MIN
+                # all-reduce in check_prefetch_progress; every rank must still
+                # create the flow whenever the rank-identical match_end > 0.
+                if match_end <= 0 or (
+                    not self.enable_lmcache and match_end <= matched_len
+                ):
                     return None
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
                 prefix_keys = (
@@ -4100,10 +4105,16 @@ class Scheduler(
                     new_input_tokens,
                     tree_cache.get_last_hash_value(last_host_node),
                     prefix_keys,
-                    matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
+                    matched_prefix_tokens=req.full_untruncated_fill_ids[
+                        : min(matched_len, match_end)
+                    ],
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
-                    storage_hit_end=storage_hit_end,
+                    storage_hit_end=(
+                        min(storage_hit_end, match_end)
+                        if storage_hit_end is not None
+                        else None
+                    ),
                 )
 
     def _process_storage_prefetch_retries(self):
@@ -4864,8 +4875,11 @@ class Scheduler(
         """Under decoder SWA bounded replay with paged SWA (outside DSpark), a
         batch-wide CaptureHiddenMode.FULL marks every request in the forward
         batch whole_extend=True, which would make a non-FULL peer with a cached
-        prefix read unwritten late-layer SWA rows. Keep FULL requests isolated
-        from non-FULL peers."""
+        prefix read unwritten late-layer SWA rows. Keep FULL prefill requests
+        isolated from non-FULL peers; mixed-chunk separation from a FULL running
+        decode batch is handled by the mixing predicate so non-FULL prefills
+        never starve."""
+        del running_batch
         isolate_fn = getattr(
             self.tree_cache, "isolates_full_hidden_state_batches", None
         )
@@ -4875,13 +4889,6 @@ class Scheduler(
         if admitted_reqs and (
             req_full
             != (admitted_reqs[0].return_hidden_states_mode == CaptureHiddenMode.FULL)
-        ):
-            return False
-        if (
-            self.is_mixed_chunk
-            and not running_batch.is_empty()
-            and running_batch.return_hidden_states_mode == CaptureHiddenMode.FULL
-            and not req_full
         ):
             return False
         return True
@@ -5252,6 +5259,15 @@ class Scheduler(
             and new_batch.input_embeds is None
             # Beam member rows are not supported inside a mixed extend batch.
             and all(r.beam_group is None for r in running_batch.reqs)
+            # Do not promote a non-FULL prefill batch to FULL via a FULL decode
+            # batch under paged-SWA bounded replay (outside DSpark).
+            and not (
+                getattr(self.tree_cache, "isolates_full_hidden_state_batches", None)
+                is not None
+                and self.tree_cache.isolates_full_hidden_state_batches()
+                and running_batch.return_hidden_states_mode == CaptureHiddenMode.FULL
+                and new_batch.return_hidden_states_mode != CaptureHiddenMode.FULL
+            )
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             finishing_reqs = self._reqs_finishing_inflight(running_batch)

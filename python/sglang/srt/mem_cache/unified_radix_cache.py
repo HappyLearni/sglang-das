@@ -1277,15 +1277,54 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
-        swa = self.components.get(ComponentType.SWA)
-        if (
+        components = getattr(self, "components", None)
+        swa = components.get(ComponentType.SWA) if components else None
+        bounded_replay_live_holdback = (
             not is_finished
-            and self.decoder_swa_bounded_replay
+            and getattr(self, "decoder_swa_bounded_replay", False)
+            and not getattr(self, "is_mamba_enabled", False)
             and swa is not None
             and swa.sliding_window_size
             and getattr(swa, "gates_prefix_match", True)
             and not getattr(req, "force_radix_leaf_creation", False)
-        ):
+        )
+        if bounded_replay_live_holdback:
+            # If PD prefill has already queued or armed private pages past
+            # cache_protected_len for async transfer (e.g. Mooncake), do not
+            # insert/dedup until is_finished=True (after transfers drain), or
+            # duplicate freeing would recycle physical pages still being read.
+            pending_pd_end = max(
+                getattr(req, "start_send_idx", 0) or 0,
+                getattr(req, "tmp_end_idx", -1) or 0,
+            )
+            has_unprotected_pd_send = (
+                getattr(req, "disagg_kv_sender", None) is not None
+                and pending_pd_end > req.kv.cache_protected_len
+            )
+            if has_unprotected_pd_send:
+                if (
+                    len(token_ids) - req.kv.cache_protected_len
+                    >= swa.sliding_window_size
+                    and getattr(self, "session", None) is not None
+                ):
+                    self.release_swa_prefix_lock(req)
+                if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+                    full_key = RadixKey(
+                        token_ids[:effective_cache_len],
+                        req.extra_key,
+                        is_bigram=self.tree_core.is_eagle,
+                        cache_salt=req.cache_salt,
+                    )
+                    for comp in self._components_tuple:
+                        comp.free_out_of_window_slots(
+                            req, len(full_key) - 1, insert_params
+                        )
+                for comp in self._components_tuple:
+                    comp.cleanup_after_caching_req(
+                        req, is_finished=is_finished, insert_params=insert_params
+                    )
+                return
+
             # Under decoder SWA bounded replay, canonical pages in the tree may
             # carry unwritten late-layer SWA rows. Keep pages overlapping this
             # live request's active SWA window [up_to - window, up_to) on
@@ -1296,6 +1335,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 max(0, len(token_ids) - swa.sliding_window_size) // self.page_size
             ) * self.page_size
             if safe_publish_end <= req.kv.cache_protected_len:
+                if (
+                    len(token_ids) - req.kv.cache_protected_len
+                    >= swa.sliding_window_size
+                    and getattr(self, "session", None) is not None
+                ):
+                    # The private tail [cache_protected_len, up_to) already
+                    # covers the full active SWA window; release the obsolete
+                    # tree SWA lock so continuation chunks cannot stall on it.
+                    self.release_swa_prefix_lock(req)
                 for comp in self._components_tuple:
                     comp.cleanup_after_caching_req(
                         req, is_finished=is_finished, insert_params=insert_params
@@ -1420,14 +1468,26 @@ class UnifiedRadixCache(BasePrefixCache):
         # admission-locked last_node (recorded only if still present, locked before
         # the next alloc) -- not this evictable node. A scheduler that matched a
         # whole batch before locking would break that. Off = original full lock.
+        skip_lock_components = []
+        if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get():
+            skip_lock_components.append(ComponentType.MAMBA)
+        skip_obsolete_swa_lock = (
+            bounded_replay_live_holdback
+            and swa is not None
+            and len(token_ids) - len(new_indices) >= swa.sliding_window_size
+        )
+        if skip_obsolete_swa_lock:
+            # The request's private tail [len(new_indices), up_to) already spans
+            # the full active SWA window, so tree-owned SWA on [0, len(new_indices))
+            # is obsolete; keep FULL locked and leave that SWA evictable so
+            # continuation chunks cannot stall on their own old lock.
+            skip_lock_components.append(ComponentType.SWA)
         req.lock = self.lock(
             new_last_node,
-            skip_lock_components=(
-                (ComponentType.MAMBA,)
-                if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
-                else ()
-            ),
+            skip_lock_components=tuple(skip_lock_components),
         )
+        if skip_obsolete_swa_lock and isinstance(req.lock, TreeLock):
+            req.lock.swa_released = True
 
         # Update req fields
         req.kv.cache_protected_len = len(new_indices)
@@ -3915,7 +3975,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 and self._req_reads_decoder_prompt_rows(req, input_len)
             ):
                 return 0
-            return max(0, input_len - swa.sliding_window_size)
+            limit = max(0, input_len - swa.sliding_window_size)
+            if (
+                return_full_match
+                and limit > 0
+                and getattr(getattr(self, "tree_core", None), "is_eagle", False)
+            ):
+                limit = min(input_len, limit + 1)
+            return limit
         if not is_unified_kv_triton():
             return None
         if self.tree_core.has_swa_host_pool:
