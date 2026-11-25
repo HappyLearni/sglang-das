@@ -607,6 +607,7 @@ class PrefillAdder:
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
+        self.init_chunk_tokens: Optional[int] = rem_chunk_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
@@ -1131,12 +1132,29 @@ class PrefillAdder:
             _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        min_replay_chunk = self._min_bounded_replay_chunk_tokens(req)
+        enforce_min_replay_chunk = (
+            min_replay_chunk > 0
+            and not self._has_undersized_bounded_replay_chunk(min_replay_chunk)
+            and req.prefix_len > 0
+            and cand_extend_input_len >= min_replay_chunk
+        )
+        if (
+            enforce_min_replay_chunk
+            and _rem_tokens < min_replay_chunk
+            and self.chunked_req_limit is not None
+        ):
+            avail = self.memory_budget.available_chunk_tokens(self.rem_chunk_tokens)
+            if avail is not None and avail >= min_replay_chunk:
+                _rem_tokens = min(avail, min_replay_chunk)
         _rem_tokens = self.memory_budget.fit_chunk(
             extend_input_len=cand_extend_input_len,
             max_new_tokens=self._swa_new_tokens(req),
             chunk_limit=_rem_tokens,
         )
         if _rem_tokens is None:
+            return req
+        if enforce_min_replay_chunk and _rem_tokens < min_replay_chunk:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
@@ -1357,6 +1375,45 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
+        # If the configured chunk budget is permanently smaller than the
+        # bounded-replay sliding window, no first chunk after a prefix hit can
+        # safely rebuild the window. Fall back to cold recompute from position 0
+        # instead of returning NO_TOKEN indefinitely.
+        min_replay_chunk = self._min_bounded_replay_chunk_tokens(req)
+        if (
+            self._has_undersized_bounded_replay_chunk(min_replay_chunk)
+            and (
+                req.prefix_len > 0
+                or req.host_hit_length > 0
+                or req.swa_host_hit_length > 0
+            )
+            and (
+                req.swa_host_hit_length > 0
+                or len(req.full_untruncated_fill_ids)
+                - (req.prefix_len + req.host_hit_length)
+                > self.init_chunk_tokens
+            )
+        ):
+            if (
+                isinstance(self.tree_cache, UnifiedRadixCache)
+                and self.tree_cache.buffer_pipeline is not None
+                and getattr(req, "cache_request_handle", None) is not None
+            ):
+                self.tree_cache.buffer_pipeline.release_staged_hold(
+                    req.cache_request_handle,
+                    reason="bounded_replay_undersized_chunk",
+                )
+            root = self.tree_cache.root_node_handle()
+            req.prefix_len = 0
+            req.last_node = root
+            req.last_host_node = root
+            req.best_match_node = root
+            req.host_hit_length = 0
+            req.swa_host_hit_length = 0
+            req.mamba_host_hit_length = 0
+            req.staged_prefetch_plan = None
+            req.kv.cache_protected_len = 0
+
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
         # _update_prefill_budget also deducts.
@@ -1543,6 +1600,14 @@ class PrefillAdder:
             return 0
         return int(swa.sliding_window_size)
 
+    def _has_undersized_bounded_replay_chunk(self, min_replay_chunk: int) -> bool:
+        init_chunk = getattr(self, "init_chunk_tokens", None)
+        return bool(
+            min_replay_chunk
+            and init_chunk is not None
+            and 0 < init_chunk < min_replay_chunk
+        )
+
     def _select_prefill_admission(
         self,
         req: Req,
@@ -1625,12 +1690,17 @@ class PrefillAdder:
                 extend_len = end - prefix_len
             if extend_len <= 0:
                 return AddReqResult.OTHER
-            if prefix_len > 0:
+            if (
+                prefix_len > 0
+                or swa_host_hit_length > 0
+                or getattr(req, "mamba_host_hit_length", 0) > 0
+            ):
                 min_replay_chunk = self._min_bounded_replay_chunk_tokens(req)
                 if min_replay_chunk and extend_len < min_replay_chunk:
                     # A chunk shorter than the sliding window after a cached
-                    # prefix makes late layers read below prefix_len into
-                    # unverified late-layer SWA rows; wait for a full window.
+                    # prefix (or a host-only SWA hit whose load-back exposes
+                    # resident FULL prefix) makes late layers read below
+                    # prefix_len into unverified late-layer SWA rows.
                     return (
                         AddReqResult.OTHER
                         if self.can_run_list

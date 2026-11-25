@@ -255,6 +255,13 @@ def _req_radix_key(
     *,
     return_full_match: bool = False,
 ) -> RadixKey:
+    if getattr(req, "positional_embed_overrides", None) is not None:
+        return RadixKey(
+            token_ids=token_ids,
+            extra_key=req.extra_key,
+            limit=0,
+            cache_salt=req.cache_salt,
+        )
     # A reused prefix may carry stale or unwritten SWA (the unified_kv ring, decoder
     # bounded replay); cap the match so the window is re-prefilled.
     key_limit = _swa_prefix_match_limit(

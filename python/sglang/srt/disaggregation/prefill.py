@@ -2700,6 +2700,52 @@ class SchedulerDisaggregationPrefillMixin:
                 # Transport notification is best effort; local ownership must
                 # still be released or the next idle invariant check will fail.
                 logger.exception("Failed to notify KV sender of abort for %s", req.rid)
+            sender_terminal = True
+            poll_fn = getattr(sender, "poll", None)
+            drained_fn = getattr(sender, "is_transfer_drained", None)
+            checked_poll = False
+            if (
+                callable(poll_fn)
+                and hasattr(self, "prefill_abort_sender_terminal")
+                and hasattr(self, "disagg_prefill_inflight_queue")
+            ):
+                try:
+                    poll_status = poll_fn()
+                except Exception:
+                    poll_status = None
+                if isinstance(poll_status, KVPoll):
+                    checked_poll = True
+                    sender_terminal = self.prefill_abort_sender_terminal(req)
+            if not checked_poll and callable(drained_fn):
+                try:
+                    drained_val = drained_fn()
+                except Exception:
+                    drained_val = False
+                if isinstance(drained_val, bool):
+                    sender_terminal = drained_val
+            if not sender_terminal:
+                # Earlier chunk transfers may still be reading this request's
+                # source KV pages (e.g. Mooncake source drain not yet complete).
+                # Retain KV/metadata ownership and defer retirement to the
+                # inflight abort drain path until the sender drains.
+                req.external_kv_sender_abort_requested = True
+                req.pending_bootstrap = False
+                reason = req.to_finish or req.finished_reason
+                if hasattr(self, "abort_external_kv_request"):
+                    self.abort_external_kv_request(
+                        req,
+                        forward_drained=self.prefill_abort_forward_drained(req),
+                        sender_terminal=False,
+                        abort_message=getattr(reason, "message", "Prefill aborted"),
+                        is_insert=False,
+                        emit_response=True,
+                    )
+                if (
+                    hasattr(self, "disagg_prefill_inflight_queue")
+                    and req not in self.disagg_prefill_inflight_queue
+                ):
+                    self.disagg_prefill_inflight_queue.append(req)
+                return False
 
         if req.to_finish is not None and not req.finished():
             req.update_finish_state()
@@ -2873,9 +2919,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if request_window is None
                 else pool.sliding_window
             )
-            window_start = max(
-                req.disagg_decode_prefix_len, end - window_size
-            )
+            window_start = max(req.disagg_decode_prefix_len, end - window_size)
             window_start = window_start // page_size * page_size
             swa = self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
                 raw[window_start:end]

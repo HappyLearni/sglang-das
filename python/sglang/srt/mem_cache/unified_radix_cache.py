@@ -51,7 +51,10 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
     default_belief_policy,
 )
-from sglang.srt.mem_cache.common import RetractionBackup
+from sglang.srt.mem_cache.common import (
+    RetractionBackup,
+    free_swa_out_of_window_slots,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1195,7 +1198,8 @@ class UnifiedRadixCache(BasePrefixCache):
         lock = (self.session.borrowed_slot(req) or req).lock
         if (
             lock is not None
-            and lock.receipt.component_lock_uuids.get(ComponentType.SWA) is not None
+            and ComponentType.SWA in lock.receipt.component_lock_uuids
+            and ComponentType.SWA not in lock.receipt.skipped_lock_components
         ):
             self.release_swa(lock)
 
@@ -1309,16 +1313,30 @@ class UnifiedRadixCache(BasePrefixCache):
                 ):
                     self.release_swa_prefix_lock(req)
                 if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
-                    full_key = RadixKey(
-                        token_ids[:effective_cache_len],
-                        req.extra_key,
-                        is_bigram=self.tree_core.is_eagle,
-                        cache_salt=req.cache_salt,
+                    # Reclaim private SWA past the active window using the actual
+                    # forward position (never truncated by an unconsumed
+                    # swa_branching_seqlen) and without prefix-sharing page
+                    # padding since this checkpoint does not insert into the tree.
+                    # FULL pages stay owned by req until async PD transfer drains.
+                    forward_len = max(0, len(token_ids) - int(self.tree_core.is_eagle))
+                    free_swa_out_of_window_slots(
+                        req,
+                        forward_len,
+                        sliding_window_size=swa.sliding_window_size,
+                        page_size=self.page_size,
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        supports_prefix_sharing=False,
+                    )
+                    insert_params.set_evicted_seqlen(
+                        ComponentType.SWA,
+                        req.kv.get_evicted_seqlen(ComponentType.SWA),
                     )
                     for comp in self._components_tuple:
-                        comp.free_out_of_window_slots(
-                            req, len(full_key) - 1, insert_params
-                        )
+                        if comp.component_type != ComponentType.SWA:
+                            comp.free_out_of_window_slots(
+                                req, max(0, forward_len - 1), insert_params
+                            )
                 for comp in self._components_tuple:
                     comp.cleanup_after_caching_req(
                         req, is_finished=is_finished, insert_params=insert_params
@@ -1536,6 +1554,15 @@ class UnifiedRadixCache(BasePrefixCache):
             is_bigram=self.tree_core.is_eagle,
             cache_salt=req.cache_salt,
         )
+        components = getattr(self, "components", None)
+        swa = components.get(ComponentType.SWA) if components else None
+        if (
+            swa is not None
+            and swa.sliding_window_size
+            and len(token_ids) - req.kv.cache_protected_len >= swa.sliding_window_size
+            and getattr(self, "session", None) is not None
+        ):
+            self.release_swa_prefix_lock(req)
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
             for comp in self._components_tuple:
                 comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)

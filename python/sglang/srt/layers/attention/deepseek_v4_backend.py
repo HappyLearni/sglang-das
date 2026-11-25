@@ -185,6 +185,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
@@ -350,7 +351,6 @@ def _should_use_sparse_prefill(
         and (allow_cp or not dsa_use_prefill_cp(forward_batch) or explicit_cp_override)
         and (q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD or sparse_prefill_enabled)
     )
-
 
 
 def _validate_hcu_sparse_prefill_result(actual, reference, query_pos):
@@ -1688,10 +1688,18 @@ class DeepseekV4AttnBackend(
         # Prefill CUDA graph source projection buffers per ratio, newest first.
         self._source_proj_bufs: Dict[int, list] = {}
         # Per forward: the model stops at the last kv_source layer (see
-        # _skips_late_layers), and no tail metadata is built.
+        # _skips_late_layers), and no tail metadata is built. Disabled when a
+        # fixed chunk size is smaller than SWA_WINDOW because no later chunk
+        # could rebuild a full window on its own.
+        chunked_prefill_size = get_schedule().chunked_prefill_size
         self.skip_mid_chunk_decoder: bool = (
             self.enable_decoder_swa_bounded_replay
             and envs.SGLANG_DSV41_SKIP_MID_CHUNK_DECODER.get()
+            and (
+                chunked_prefill_size is None
+                or chunked_prefill_size <= 0
+                or chunked_prefill_size >= SWA_WINDOW
+            )
         )
         self.skip_late_layers: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
@@ -6723,8 +6731,7 @@ class DeepseekV4AttnBackend(
         q_flat = q.squeeze(1)
 
         compact_workspace = (
-            self.is_dsv41
-            and _use_dsv41_compact_sparse_prefill_workspace(forward_batch)
+            self.is_dsv41 and _use_dsv41_compact_sparse_prefill_workspace(forward_batch)
         )
         # RequestWindow changes the SWA gather, not compressed logical rows.
         # Its explicit SWA indices share a global suffix (zero per-request

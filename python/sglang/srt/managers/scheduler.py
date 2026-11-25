@@ -5013,6 +5013,27 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        non_mixing_full_decode = (
+            self.is_mixed_chunk
+            and not running_batch.is_empty()
+            and getattr(self.tree_cache, "isolates_full_hidden_state_batches", None)
+            is not None
+            and self.tree_cache.isolates_full_hidden_state_batches()
+            and running_batch.return_hidden_states_mode == CaptureHiddenMode.FULL
+            and (
+                (
+                    self.chunked_req is not None
+                    and self.chunked_req.return_hidden_states_mode
+                    != CaptureHiddenMode.FULL
+                )
+                or (
+                    self.chunked_req is None
+                    and bool(self.waiting_queue)
+                    and self.waiting_queue[0].return_hidden_states_mode
+                    != CaptureHiddenMode.FULL
+                )
+            )
+        )
         adder = self.get_prefill_adder_class()(
             self.page_size,
             self.tree_cache,
@@ -5021,7 +5042,7 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            running_bs if (self.is_mixed_chunk and not non_mixing_full_decode) else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
@@ -5260,7 +5281,9 @@ class Scheduler(
             # Beam member rows are not supported inside a mixed extend batch.
             and all(r.beam_group is None for r in running_batch.reqs)
             # Do not promote a non-FULL prefill batch to FULL via a FULL decode
-            # batch under paged-SWA bounded replay (outside DSpark).
+            # batch under paged-SWA bounded replay (outside DSpark), nor mix if
+            # running_bs was withheld from the prefill chunk budget above.
+            and not non_mixing_full_decode
             and not (
                 getattr(self.tree_cache, "isolates_full_hidden_state_batches", None)
                 is not None

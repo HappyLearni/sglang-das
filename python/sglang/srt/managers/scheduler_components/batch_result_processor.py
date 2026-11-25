@@ -193,6 +193,9 @@ class SchedulerBatchResultProcessor:
         # bounded to the prefill-committed prompt snapshot so MTP accepted/draft
         # deltas never enter the tree.
         req.dsv4_decode_radix_cache_prompt_once = False
+        if getattr(req, "positional_embed_overrides", None) is not None:
+            req.allow_radix_cache_insert_once = False
+            return
         req.allow_radix_cache_insert_once = True
         prompt_len = getattr(req, "dsv4_decode_radix_cache_prompt_len", None)
         if prompt_len is None:

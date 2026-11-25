@@ -13363,17 +13363,23 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         req.start_send_idx = 256
 
         # Chunk 2 [256..512): because start_send_idx=256 > cache_protected_len=0,
-        # p0_private must stay owned by req (not deduped/freed back to allocator).
+        # p0_private FULL must stay owned by req (not deduped/freed back to
+        # allocator), while Page 0's out-of-window private SWA is reclaimed so
+        # a small SWA pool cannot strand a lone prefill.
         p1_private = self._alloc_paged(allocator, 256)
         self.assertIsNotNone(p1_private)
         pool.write((req.kv.req_pool_idx, slice(256, 512)), p1_private)
         req.kv.kv_allocated_len = 512
         req.kv.kv_committed_len = 512
         req.extend_end = 512
+        req.swa_branching_seqlen = 256
         free_full_before = allocator.full_available_size()
+        free_swa_before = allocator.swa_available_size()
         checkpoint_kv_cache(req, cache)
         self.assertEqual(req.kv.cache_protected_len, 0)
         self.assertEqual(allocator.full_available_size(), free_full_before)
+        self.assertEqual(allocator.swa_available_size(), free_swa_before + 256)
+        self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), 256)
         torch.testing.assert_close(
             pool.req_to_token[req.kv.req_pool_idx, :256].to(torch.int64),
             p0_private.to(torch.int64),
@@ -13671,6 +13677,278 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         mreq.finished_reason = FINISH_LENGTH(length=0)
         release_kv_cache(mreq, cache, checkpoint=False)
         cache.sanity_check()
+
+    def test_round3_admission_abort_locks_and_embed_override_regressions(self):
+        """Regression tests for Round-3 findings:
+        1. PD abort defers KV release while Mooncake source transfer is undrained.
+        2. HiCache host-only SWA restoration respects first-chunk minimum.
+        3. add_chunked_req defers short continuation (< window) after skipped mid-chunk.
+        4. Root-bounded SWA lock (uuid=None) and advance_unpublished_req release obsolete SWA lock.
+        5. positional_embed_overrides is excluded on PD decode lookup and donation.
+        6. Permanently undersized chunk budget falls back to cold recompute."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.prefill import (
+            SchedulerDisaggregationPrefillMixin,
+        )
+        from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
+        )
+        from sglang.srt.mem_cache.common import match_kv_cache
+
+        # 1) Ordinary PD prefill abort must NOT release KV while sender is undrained.
+        drained = {"done": False}
+        sender = SimpleNamespace(
+            abort=Mock(),
+            poll=lambda: KVPoll.Failed,
+            is_transfer_drained=lambda: drained["done"],
+        )
+        abort_req = Req(
+            rid="pd-abort-undrained",
+            origin_input_text="",
+            origin_input_ids=array("q", list(range(1, 513))),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        abort_req.disagg_kv_sender = sender
+        abort_req.kv.req_pool_idx = 0
+        abort_req.metadata_buffer_index = 1
+        abort_sched = SimpleNamespace(
+            disagg_prefill_pending_chunk_rids={"pd-abort-undrained"},
+            disagg_prefill_inflight_queue=[],
+            _external_kv_abort_rids=set(),
+            _external_kv_cleanup_rids=set(),
+            tree_cache=Mock(),
+            req_to_metadata_buffer_idx_allocator=Mock(),
+            output_streamer=Mock(),
+            _release_aborted_request=Mock(),
+        )
+        abort_sched.clear_pending_chunk_send = lambda r: (
+            SchedulerDisaggregationPrefillMixin.clear_pending_chunk_send(abort_sched, r)
+        )
+        abort_sched.prefill_abort_sender_terminal = lambda r: (
+            SchedulerDisaggregationPrefillMixin.prefill_abort_sender_terminal(
+                abort_sched, r
+            )
+        )
+        abort_sched.prefill_abort_forward_drained = lambda r: (
+            SchedulerDisaggregationPrefillMixin.prefill_abort_forward_drained(
+                abort_sched, r
+            )
+        )
+        abort_sched.abort_external_kv_request = lambda r, **kw: (
+            SchedulerDisaggregationPrefillMixin.abort_external_kv_request(
+                abort_sched, r, **kw
+            )
+        )
+        retired = SchedulerDisaggregationPrefillMixin._retire_aborted_prefill_result(
+            abort_sched, abort_req
+        )
+        self.assertFalse(retired)
+        sender.abort.assert_called_once()
+        self.assertTrue(abort_req.kv.holds_kv)
+        self.assertIn(abort_req, abort_sched.disagg_prefill_inflight_queue)
+        self.assertIn(abort_req.rid, abort_sched._external_kv_abort_rids)
+
+        # 2 & 3) Host-only SWA hit (prefix_len=0, swa_host_hit_length=256) and
+        # short continuation chunk (< window) in add_chunked_req must both defer.
+        cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            page_size=256,
+            sliding_window_size=128,
+            kv_size=2048,
+            max_context_len=1024,
+            decoder_swa_bounded_replay=True,
+            swa_gates_prefix_match=True,
+        )
+        cache, allocator, pool = build_fixture(cfg)
+        prompt = list(range(1, 641))
+        req_swa_host = Req(
+            rid="swa-host-restore",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt[:400]),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_swa_host.refresh_fill_ids()
+        req_swa_host.prefix_len = 0
+        adder = PrefillAdder.__new__(PrefillAdder)
+        adder.tree_cache = cache
+        adder.page_size = 256
+        adder.dllm_config = None
+        adder.exact_chunk_fill = True
+        adder.init_chunk_tokens = 256
+        adder.rem_input_tokens = 4096
+        adder.rem_chunk_tokens = 64
+        adder.chunked_req_limit = None
+        adder.prefill_delayer_single_pass = None
+        adder.kv_shard_granule = 0
+        adder.can_run_list = []
+        adder._replay_len = lambda r, p: 0
+        adder._check_prefill_tile_budget = lambda t: None
+        adder.memory_budget = SimpleNamespace(
+            check_prefill=lambda **kwargs: (True, kwargs["chunk_limit"]),
+            available_chunk_tokens=lambda rem: rem,
+            fit_chunk=lambda **kwargs: 64,
+        )
+        res_host = adder._select_prefill_admission(
+            req_swa_host,
+            total_tokens=400,
+            host_hit_length=0,
+            swa_host_hit_length=256,
+            truncation_align_size=None,
+            has_chunked_req=False,
+        )
+        self.assertEqual(res_host, AddReqResult.NO_TOKEN)
+
+        # Short continuation chunk [512, 576) on 640-token prompt defers in add_chunked_req.
+        req_cont = Req(
+            rid="short-cont",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_cont.refresh_fill_ids()
+        req_cont.prefix_len = 512
+        adder.rem_chunk_tokens = 256
+        self.assertIs(adder.add_chunked_req(req_cont), req_cont)
+        self.assertEqual(adder.can_run_list, [])
+
+        # 4a) Root-bounded SWA lock (prefix=64 < window=256, lock uuid=None)
+        # must be released by release_swa_prefix_lock / checkpoint early return.
+        small_cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            page_size=64,
+            sliding_window_size=256,
+            kv_size=1024,
+            max_context_len=1024,
+            decoder_swa_bounded_replay=True,
+            swa_gates_prefix_match=True,
+        )
+        small_cache, small_alloc, small_pool = build_fixture(small_cfg)
+        p_small = list(range(5001, 5513))
+        s0 = self._alloc_paged(small_alloc, 64)
+        self.assertIsNotNone(s0)
+        small_cache.insert(
+            InsertParams(key=RadixKey(array("q", p_small[:64])), value=s0.clone())
+        )
+        r_root_lock = Req(
+            rid="root-bounded-swa-lock",
+            origin_input_text="",
+            origin_input_ids=array("q", p_small),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        r_root_lock.init_next_round_input(small_cache)
+        self.assertEqual(r_root_lock.prefix_len, 64)
+        r_root_lock.lock = small_cache.lock(r_root_lock.last_node)
+        self.assertIn(ComponentType.SWA, r_root_lock.lock.receipt.component_lock_uuids)
+        self.assertIsNone(
+            r_root_lock.lock.receipt.component_lock_uuids[ComponentType.SWA]
+        )
+        self.assertEqual(small_cache.swa_evictable_size(), 0)
+        self.assertIsNotNone(small_pool.alloc([r_root_lock]))
+        small_pool.write((r_root_lock.kv.req_pool_idx, slice(0, 64)), s0)
+        s_tail = self._alloc_paged(small_alloc, 256)
+        self.assertIsNotNone(s_tail)
+        small_pool.write((r_root_lock.kv.req_pool_idx, slice(64, 320)), s_tail)
+        r_root_lock.kv.kv_allocated_len = 320
+        r_root_lock.kv.kv_committed_len = 320
+        r_root_lock.extend_end = 320
+        # 4b) advance_unpublished_req also releases obsolete tree SWA lock.
+        small_cache.advance_unpublished_req(r_root_lock)
+        self.assertTrue(r_root_lock.lock.swa_released)
+        self.assertEqual(small_cache.swa_evictable_size(), 64)
+        r_root_lock.finished_reason = FINISH_LENGTH(length=0)
+        release_kv_cache(r_root_lock, small_cache, checkpoint=False)
+        small_cache.sanity_check()
+
+        # 5) positional_embed_overrides: PD decode lookup returns 0 AND donor skips.
+        cached_ov = self._alloc_paged(allocator, 256)
+        self.assertIsNotNone(cached_ov)
+        allocator.free_swa_segment(cached_ov, start_pos=0)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", prompt[:256])),
+                value=cached_ov.clone(),
+                component_evicted_seqlens={ComponentType.SWA: 256},
+                force_leaf_creation=True,
+            )
+        )
+        ov_req = Req(
+            rid="pd-decode-override",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=4),
+        )
+        ov_req.positional_embed_overrides = SimpleNamespace(
+            positions=[0], embeds=torch.zeros((1, 4))
+        )
+        match_kv_cache(
+            ov_req,
+            cache,
+            ov_req.origin_input_ids,
+            max_prefix_len=256,
+            return_full_match=True,
+        )
+        self.assertEqual(ov_req.prefix_len, 0)
+        self.assertEqual(ov_req.num_matched_prefix_tokens, 0)
+        ov_req.refresh_fill_ids()
+        ov_req.lock = cache.lock(cache.root_node_handle())
+        self.assertIsNotNone(pool.alloc([ov_req]))
+        ov_slots = self._alloc_paged(allocator, 640)
+        self.assertIsNotNone(ov_slots)
+        pool.write((ov_req.kv.req_pool_idx, slice(0, 640)), ov_slots)
+        ov_req.kv.kv_allocated_len = 640
+        ov_req.kv.kv_committed_len = 640
+        ov_req.extend_end = 640
+        ov_req.dsv4_decode_radix_cache_prompt_once = True
+        ov_req.dsv4_decode_radix_cache_prompt_len = 640
+        proc = SimpleNamespace(
+            tree_cache=cache,
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=allocator,
+            model_config=SimpleNamespace(sliding_window_size=128),
+        )
+        SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(
+            proc, ov_req
+        )
+        self.assertEqual(ov_req.kv.cache_protected_len, 0)
+        ov_req.finished_reason = FINISH_LENGTH(length=0)
+        release_kv_cache(ov_req, cache, checkpoint=False)
+        cache.sanity_check()
+
+        # 6) Permanently undersized chunk (page=64, window=256, chunk=128):
+        # idle PrefillAdder.add_one_req falls back to cold recompute instead of NO_TOKEN.
+        for exact_fill in (True, False):
+            with self.subTest(exact_chunk_fill=exact_fill):
+                u_req = Req(
+                    rid=f"undersized-{exact_fill}",
+                    origin_input_text="",
+                    origin_input_ids=array("q", p_small[:400]),
+                    sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+                )
+                u_req.init_next_round_input(small_cache)
+                self.assertEqual(u_req.prefix_len, 64)
+                u_adder = PrefillAdder(
+                    page_size=64,
+                    tree_cache=small_cache,
+                    token_to_kv_pool_allocator=small_alloc,
+                    running_batch=SimpleNamespace(reqs=[]),
+                    new_token_ratio=0.7,
+                    rem_input_tokens=4096,
+                    rem_chunk_tokens=128,
+                    num_mixed_decode_tokens=0,
+                )
+                u_adder.exact_chunk_fill = exact_fill
+                u_adder.add_one_req(
+                    u_req, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(u_adder.can_run_list, [u_req])
+                self.assertEqual(u_req.prefix_len, 0)
+                self.assertEqual(u_req.extend_end, 128)
+                small_cache.unlock(u_req.lock)
+        small_cache.sanity_check()
 
 
 if __name__ == "__main__":
