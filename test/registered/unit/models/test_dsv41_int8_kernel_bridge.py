@@ -19,6 +19,7 @@ class TestInt8KernelBridge(unittest.TestCase):
         for function in [dsv41_int8.backend, dsv41_int8._service_config, dsv41_int8._algorithms, dsv41_int8._scale_schedules]:
             function.cache_clear()
         dsv41_int8._algo_rank_cache.clear()
+        dsv41_int8._failed_static_algo_keys.clear()
         dsv41_int8._device_arch_cache.clear()
 
     def test_backend_lazily_binds_installed_kernel_once(self):
@@ -199,7 +200,7 @@ class TestInt8KernelBridge(unittest.TestCase):
                 dsv41_int8._lookup_default_unpacked_algo_rank(dev, 4096, 8, 1024, 4096, 0, False)
             )
 
-    def test_project_unpacked_default_uses_static_rank_and_falls_back_to_zero(self):
+    def test_project_unpacked_default_uses_static_rank_and_caches_fallback_to_zero(self):
         calls = []
 
         def fake_gemm_out(q, w, raw, groups, tile_n, group_major, algo_rank=0):
@@ -216,16 +217,21 @@ class TestInt8KernelBridge(unittest.TestCase):
         w = torch.zeros(8192, 4096, dtype=torch.int8)
         s = torch.ones(8192, 1, dtype=torch.float32)
         with (
-            patch.dict(os.environ),
+            patch.dict(
+                os.environ, {"SGLANG_DSV41_INT8_BLASLT_STATIC_ALGO": "1"}, clear=False
+            ),
             patch.object(dsv41_int8, "load_native", return_value=ops),
-            patch.object(dsv41_int8, "_lookup_default_unpacked_algo_rank", return_value=1),
+            patch.object(dsv41_int8, "_is_gfx936_device", return_value=True),
             patch.object(dsv41_int8, "_select_unpacked_algo_rank") as mock_autotune,
         ):
             os.environ.pop("SGLANG_DSV41_INT8_BLASLT_AUTOTUNE", None)
             os.environ.pop("SGLANG_DSV41_INT8_BLASLT_ALGO_CONFIG", None)
+            # First call tries static rank 1, catches RuntimeError, caches failure, falls back to 0.
+            dsv41_int8._project_unpacked(x, w, s, 8, 1024)
+            # Second call goes directly to rank 0 without retrying the rejected static rank.
             dsv41_int8._project_unpacked(x, w, s, 8, 1024)
         mock_autotune.assert_not_called()
-        self.assertEqual(calls, [1, 0])
+        self.assertEqual(calls, [1, 0, 0])
 
     def test_autotune_buckets_large_prefill_t_but_keeps_small_decode_exact(self):
         self.assertEqual(dsv41_int8._autotune_t_bucket(6), 6)

@@ -86,6 +86,7 @@ _packs = {}
 _plans = {}
 _scale_seen = set()
 _algo_rank_cache: OrderedDict = OrderedDict()
+_failed_static_algo_keys: set = set()
 _ALGO_RANK_CACHE_MAX_ENTRIES = 4096
 _TRITON_SCALE_MIN_ELEMENTS = 4_194_304
 _device_arch_cache: dict = {}
@@ -373,6 +374,17 @@ def _lookup_default_unpacked_algo_rank(
 ):
     if not _blaslt_static_algo_enabled() or not _is_gfx936_device(device):
         return None
+    cache_key = (
+        getattr(device, "index", None),
+        _autotune_t_bucket(t),
+        groups,
+        rank,
+        k,
+        tile_n,
+        bool(group_major),
+    )
+    if cache_key in _failed_static_algo_keys:
+        return None
     spec = _DEFAULT_GFX936_UNPACKED_ALGO_RANKS.get(
         (groups, rank, k, tile_n, bool(group_major))
     )
@@ -506,6 +518,20 @@ def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, 
         ops.gemm_out(q, w, raw, groups, tile_n, group_major, algo_rank)
     except RuntimeError:
         if (use_autotune or used_static) and algo_rank != 0:
+            fail_key = (
+                getattr(x.device, "index", None),
+                _autotune_t_bucket(t),
+                groups,
+                rank,
+                k,
+                tile_n,
+                bool(group_major),
+            )
+            with _lock:
+                if used_static:
+                    _failed_static_algo_keys.add(fail_key)
+                if use_autotune:
+                    _algo_rank_cache[fail_key] = 0
             ops.gemm_out(q, w, raw, groups, tile_n, group_major, 0)
         else:
             raise
