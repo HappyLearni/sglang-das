@@ -26,6 +26,38 @@ _W8A8_SMALL_M_ASM_TUNES: Tuple[int, ...] = (1, 2, 3, 4, 9)
 _W8A8_SMALL_M_AUTOTUNE_CACHE: Dict[
     Tuple[Optional[int], int, int, int, torch.dtype], Tuple[str, int]
 ] = {}
+_W8A8_FAILED_STATIC_KEYS: set = set()
+_W8A8_DEVICE_ARCH_CACHE: Dict[Optional[int], bool] = {}
+
+# Offline-benchmarked small-M (M <= 64) W8A8 GEMM kernel table for Hygon BW1000
+# (gfx936, DTK 26.04.1, BF16 output) covering DeepSeek-V4.1 dense projections.
+# Key: (n_i, k_i) -> {m_bucket: (kind, tune)} where m_bucket in {8, 16, 32, 64}.
+# Uncovered shapes and non-gfx936 devices fall back directly to
+# _default_w8a8_smooth_asm_tune without online synchronization or timing.
+_DEFAULT_GFX936_W8A8_SMALL_M_TABLE: Dict[
+    Tuple[int, int], Dict[int, Tuple[str, int]]
+] = {
+    (1792, 5120): {8: ("smooth_asm", 1), 16: ("smooth_asm", 1), 32: ("smooth_asm", 1), 64: ("smooth_asm", 2)},
+    (2048, 5120): {8: ("smooth_asm", 1), 16: ("smooth_asm", 1), 32: ("smooth_asm", 1), 64: ("smooth_asm", 2)},
+    (2112, 5120): {8: ("smooth_asm", 1), 16: ("smooth_asm", 1), 32: ("smooth_asm", 1), 64: ("smooth_asm", 9)},
+    (2304, 5120): {8: ("smooth_asm", 1), 16: ("smooth_asm", 1), 32: ("smooth_asm", 1), 64: ("smooth_asm", 9)},
+    (2560, 5120): {8: ("smooth_asm", 1), 16: ("smooth_asm", 1), 32: ("smooth_asm", 1), 64: ("smooth_asm", 9)},
+    (3200, 6144): {8: ("smooth_asm", 2), 16: ("smooth_asm", 2), 32: ("smooth_asm", 2), 64: ("smooth_asm", 3)},
+    (4096, 1280): {8: ("smooth_asm", 2), 16: ("smooth_asm", 9), 32: ("smooth_asm", 9), 64: ("smooth_asm", 9)},
+    (4096, 5120): {8: ("smooth_asm", 2), 16: ("smooth_asm", 2), 32: ("smooth_asm", 2), 64: ("smooth_asm", 9)},
+    (4608, 5120): {8: ("smooth_asm", 9), 16: ("smooth_asm", 9), 32: ("smooth_asm", 2), 64: ("smooth_asm", 9)},
+    (5120, 2048): {8: ("smooth_asm", 2), 16: ("smooth_asm", 9), 32: ("smooth_asm", 2), 64: ("smooth_asm", 9)},
+    (5120, 2304): {8: ("smooth_asm", 9), 16: ("smooth_asm", 9), 32: ("smooth_asm", 2), 64: ("smooth_asm", 9)},
+    (5120, 4096): {8: ("smooth_asm", 9), 16: ("smooth_asm", 9), 32: ("smooth_asm", 9), 64: ("smooth_asm", 3)},
+    (5120, 5120): {8: ("lightop_channel", 0), 16: ("lightop_channel", 0), 32: ("smooth_asm", 1), 64: ("smooth_asm", 9)},
+    (5120, 8192): {8: ("lightop_channel", 0), 16: ("smooth_asm", 1), 32: ("smooth_asm", 1), 64: ("smooth_asm", 3)},
+    (8192, 4096): {8: ("lightop_channel", 0), 16: ("smooth_asm", 2), 32: ("smooth_asm", 2), 64: ("smooth_asm", 3)},
+    (8192, 5120): {8: ("smooth_asm", 2), 16: ("smooth_asm", 2), 32: ("smooth_asm", 2), 64: ("smooth_asm", 9)},
+    (16160, 5120): {8: ("smooth_asm", 1), 16: ("smooth_asm", 1), 32: ("smooth_asm", 1), 64: ("smooth_asm", 9)},
+    (16384, 5120): {8: ("smooth_asm", 1), 16: ("smooth_asm", 1), 32: ("smooth_asm", 1), 64: ("smooth_asm", 9)},
+    (25600, 6144): {8: ("smooth_asm", 1), 16: ("smooth_asm", 1), 32: ("smooth_asm", 1), 64: ("smooth_asm", 9)},
+    (32768, 5120): {8: ("smooth_asm", 1), 16: ("smooth_asm", 1), 32: ("smooth_asm", 1), 64: ("smooth_asm", 9)},
+}
 
 try:
     from lightop import gemm_ops as quant_ops
@@ -85,8 +117,55 @@ def _default_w8a8_smooth_asm_tune(m_i: int, n_i: int) -> Optional[int]:
     return None
 
 
+def _hcu_w8a8_small_m_static_enabled() -> bool:
+    return get_bool_env_var("SGLANG_HCU_W8A8_SMALL_M_STATIC", "true")
+
+
 def _hcu_w8a8_small_m_autotune_enabled() -> bool:
-    return get_bool_env_var("SGLANG_HCU_W8A8_SMALL_M_AUTOTUNE", "true")
+    # Online synchronous timing in forward is strictly opt-in (for offline
+    # tuning or explicit startup warmup) so serving requests never pay
+    # per-bucket probing/module-load stalls.
+    return get_bool_env_var("SGLANG_HCU_W8A8_SMALL_M_AUTOTUNE", "false")
+
+
+def _is_gfx936_device(device: torch.device) -> bool:
+    if device is None or getattr(device, "type", None) != "cuda":
+        return False
+    idx = device.index
+    cached = _W8A8_DEVICE_ARCH_CACHE.get(idx)
+    if cached is not None:
+        return cached
+    try:
+        props = torch.cuda.get_device_properties(device)
+        arch = getattr(props, "gcnArchName", "").split(":")[0]
+    except Exception:
+        arch = ""
+    match = arch == "gfx936"
+    _W8A8_DEVICE_ARCH_CACHE[idx] = match
+    return match
+
+
+def _lookup_default_w8a8_small_m_kernel(
+    device: torch.device,
+    m_i: int,
+    n_i: int,
+    k_i: int,
+    out_dtype: torch.dtype,
+) -> Optional[Tuple[str, int]]:
+    if (
+        out_dtype != torch.bfloat16
+        or not _hcu_w8a8_small_m_static_enabled()
+        or not _is_gfx936_device(device)
+    ):
+        return None
+    m_bucket = _w8a8_small_m_bucket(m_i)
+    fail_key = (device.index, m_bucket, n_i, k_i, out_dtype)
+    if fail_key in _W8A8_FAILED_STATIC_KEYS:
+        return None
+    per_shape = _DEFAULT_GFX936_W8A8_SMALL_M_TABLE.get((n_i, k_i))
+    if per_shape is None:
+        return None
+    return per_shape.get(m_bucket)
 
 
 def _try_lightop_channel_int8_mm(
@@ -231,10 +310,17 @@ def triton_scaled_mm(
         n_i = b.shape[1]
         # The tuned slide values are valid for complete K=256 tiles.
         if k_i % 256 == 0 and _w8a8_smooth_asm_supported(a.device):
-            if m_i <= _W8A8_SMALL_M_AUTOTUNE_MAX_M and _hcu_w8a8_small_m_autotune_enabled():
-                selected = _select_hcu_w8a8_small_m_kernel(
-                    a, b, scale_a, scale_b, out_dtype, m_i, n_i, k_i
-                )
+            if m_i <= _W8A8_SMALL_M_AUTOTUNE_MAX_M:
+                used_static = False
+                if _hcu_w8a8_small_m_autotune_enabled():
+                    selected = _select_hcu_w8a8_small_m_kernel(
+                        a, b, scale_a, scale_b, out_dtype, m_i, n_i, k_i
+                    )
+                else:
+                    selected = _lookup_default_w8a8_small_m_kernel(
+                        a.device, m_i, n_i, k_i, out_dtype
+                    )
+                    used_static = selected is not None
                 if selected is not None:
                     try:
                         out = _run_w8a8_small_m_candidate(
@@ -253,6 +339,16 @@ def triton_scaled_mm(
                             return out
                     except Exception:
                         pass
+                    if used_static:
+                        _W8A8_FAILED_STATIC_KEYS.add(
+                            (
+                                a.device.index,
+                                _w8a8_small_m_bucket(m_i),
+                                n_i,
+                                k_i,
+                                out_dtype,
+                            )
+                        )
             tune = _default_w8a8_smooth_asm_tune(m_i, n_i)
             if tune is not None:
                 try:
