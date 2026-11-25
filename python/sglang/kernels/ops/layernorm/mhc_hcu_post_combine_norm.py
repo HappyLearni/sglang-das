@@ -25,6 +25,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.utils import get_bool_env_var, is_hcu
 
 _HCU_MHC_MIN_TOKENS = 512
@@ -34,8 +35,10 @@ _HCU_MHC_MULT = 4
 
 
 def is_hcu_mhc_post_combine_norm_enabled() -> bool:
-    return is_hcu() and get_bool_env_var(
-        "SGLANG_HCU_FUSED_MHC_POST_COMBINE_NORM", "true"
+    return (
+        is_hcu()
+        and get_bool_env_var("SGLANG_HCU_FUSED_MHC_POST_COMBINE_NORM", "true")
+        and not is_batch_invariant_mode_enabled()
     )
 
 
@@ -89,7 +92,7 @@ def _mhc_post_combine_norm_hcu_kernel(
     H: tl.constexpr,
     H_PAD: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, H_PAD)
     mask = offs < H
 

@@ -38,6 +38,7 @@ class TestMhcHcuPostCombineNormDispatch(unittest.TestCase):
 
         with (
             patch.object(mod, "is_hcu", return_value=True),
+            patch.object(mod, "is_batch_invariant_mode_enabled", return_value=False),
             patch.dict(
                 os.environ, {"SGLANG_HCU_FUSED_MHC_POST_COMBINE_NORM": "1"}, clear=False
             ),
@@ -52,8 +53,21 @@ class TestMhcHcuPostCombineNormDispatch(unittest.TestCase):
                 mod.can_use_hcu_mhc_post_combine_norm(cfg, y_small, r_small, next_ok)
             )
 
+        # Batch-invariant mode must disable fused dispatch across threshold boundaries.
         with (
             patch.object(mod, "is_hcu", return_value=True),
+            patch.object(mod, "is_batch_invariant_mode_enabled", return_value=True),
+            patch.dict(
+                os.environ, {"SGLANG_HCU_FUSED_MHC_POST_COMBINE_NORM": "1"}, clear=False
+            ),
+        ):
+            self.assertFalse(
+                mod.can_use_hcu_mhc_post_combine_norm(cfg, y_ok, r_ok, next_ok)
+            )
+
+        with (
+            patch.object(mod, "is_hcu", return_value=True),
+            patch.object(mod, "is_batch_invariant_mode_enabled", return_value=False),
             patch.dict(
                 os.environ, {"SGLANG_HCU_FUSED_MHC_POST_COMBINE_NORM": "0"}, clear=False
             ),
@@ -119,6 +133,87 @@ class TestMhcHcuPostCombineNormDevice(unittest.TestCase):
             y_err = (out_y.float() - ref_y.float()).abs().max().item()
             self.assertLessEqual(r_err, 1.6e-2, f"M={m} residual max err={r_err}")
             self.assertLessEqual(y_err, 3.2e-2, f"M={m} norm max err={y_err}")
+
+    def test_batch_invariant_mode_is_bitwise_identical_across_511_to_512_threshold(self):
+        """Regression test: expanding 511 -> 512 rows under batch-invariant mode
+        must keep the first 511 rows bitwise identical."""
+        from sglang.srt.layers.layernorm import RMSNorm
+        from sglang.srt.models import deepseek_v4_mhc as mhc
+
+        device = torch.device("cuda")
+        gen = torch.Generator(device=device).manual_seed(77)
+        norm = RMSNorm(5120, eps=1e-6).to(device=device, dtype=torch.bfloat16)
+        norm.weight.data.copy_(
+            (torch.randn((5120,), device=device, generator=gen) * 0.25 + 1.0).to(
+                torch.bfloat16
+            )
+        )
+        cfg = mhc.HcConfig(
+            mult=4,
+            sinkhorn_iters=20,
+            eps=1e-6,
+            rms_eps=1e-20,
+            hidden=5120,
+            pre_from_prev=True,
+            cp_prefill=True,
+        )
+        hc = mhc.HcSubLayer(
+            cfg=cfg,
+            fn=torch.empty(0, device=device),
+            scale=torch.empty(0, device=device),
+            base=torch.empty(0, device=device),
+            norm=norm,
+        )
+        next_b = mhc.make_boundary(norm, accepts_mxfp8=False)
+
+        x512 = (torch.randn((512, 5120), device=device, generator=gen) * 0.5).to(
+            torch.bfloat16
+        )
+        res512 = (torch.randn((512, 4, 5120), device=device, generator=gen) * 0.5).to(
+            torch.bfloat16
+        )
+        post512 = torch.rand((512, 4), device=device, generator=gen, dtype=torch.float32)
+        comb512 = torch.softmax(
+            torch.randn((512, 4, 4), device=device, generator=gen, dtype=torch.float32),
+            dim=-1,
+        )
+        pre512 = torch.rand((512, 4), device=device, generator=gen, dtype=torch.float32)
+
+        with (
+            patch.object(mod, "is_batch_invariant_mode_enabled", return_value=True),
+            patch(
+                "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+                return_value=True,
+            ),
+            patch(
+                "sglang.kernels.ops.layernorm.mhc.is_dsa_prefill_cp_interleave",
+                return_value=False,
+            ),
+            patch.dict(
+                os.environ, {"SGLANG_HCU_FUSED_MHC_POST_COMBINE_NORM": "1"}, clear=False
+            ),
+        ):
+            st511 = mhc._post_fusion(
+                hc,
+                x512[:511],
+                res512[:511],
+                (pre512[:511], post512[:511], comb512[:511]),
+                next_b,
+            )
+            st512 = mhc._post_fusion(
+                hc,
+                x512,
+                res512,
+                (pre512, post512, comb512),
+                next_b,
+            )
+            # Neither should take the fused path under batch-invariant mode.
+            self.assertIsNone(st511.input)
+            self.assertIsNone(st512.input)
+            y511 = mhc.combine(hc, st511)
+            y512 = mhc.combine(hc, st512)
+            self.assertTrue(torch.equal(st511.residual, st512.residual[:511]))
+            self.assertTrue(torch.equal(y511, y512[:511]))
 
 
 if __name__ == "__main__":
