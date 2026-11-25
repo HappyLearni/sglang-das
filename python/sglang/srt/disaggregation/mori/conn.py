@@ -696,12 +696,21 @@ class MoriKVManager(CommonKVManager):
         statuses: List[TransferStatus],
         failure_reason: Optional[str],
     ) -> None:
-        # Conclude before the handoff so decode hears now and later chunks skip;
-        # source KV release and any deferred decode ACK wait for the drain.
         if failure_reason is not None:
-            self.conclude_failure(
-                bootstrap_room=kv_chunk.room, failure_reason=failure_reason
-            )
+            if self.enable_deferred_decode_kv_release:
+                # Decode holds destination KV until the deferred abort ACK fires
+                # after drain, so conclude immediately to fail fast.
+                self.conclude_failure(
+                    bootstrap_room=kv_chunk.room, failure_reason=failure_reason
+                )
+            else:
+                # Without deferred decode release, decode frees destination KV as
+                # soon as Failed is published on the wire. Only mark local status
+                # Failed now so later chunks skip, and defer wire publication
+                # until all in-progress writes settle in the drainer.
+                self.record_failure(kv_chunk.room, failure_reason)
+                self.update_status(kv_chunk.room, KVPoll.Failed)
+                kv_chunk._deferred_failure_reason = failure_reason
         drain_queue = getattr(self, "_drain_queue", None)
         if drain_queue is not None:
             drain_queue.put((kv_chunk, statuses))
@@ -732,6 +741,12 @@ class MoriKVManager(CommonKVManager):
         for status in statuses:
             if status.InProgress():
                 status.Wait()
+        deferred_reason = getattr(kv_chunk, "_deferred_failure_reason", None)
+        if deferred_reason is not None:
+            kv_chunk._deferred_failure_reason = None
+            self.conclude_failure(
+                bootstrap_room=kv_chunk.room, failure_reason=deferred_reason
+            )
         self._mark_transfer_quiescent(kv_chunk)
 
     def _should_skip_transfer(self, room: int) -> bool:

@@ -192,6 +192,7 @@ def unified_memory_disagg_move_gate(scheduler):
             return not (
                 scheduler.disagg_prefill_inflight_queue
                 or scheduler.disagg_prefill_pending_chunk_rids
+                or getattr(scheduler, "_external_kv_chunked_abort_reqs", None)
             )
 
         return prefill_gate

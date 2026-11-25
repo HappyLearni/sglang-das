@@ -1925,6 +1925,27 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         handles.append(aux_xfer_handle)
 
                 if staging_deferred:
+                    # Settle any handles already posted for earlier peers in
+                    # this chunk before yielding to the re-enqueued retry so an
+                    # abort cannot mark the chunk drained while an earlier
+                    # peer's RDMA transfer is still active.
+                    if handles:
+                        settled, any_failed = self._await_handles(
+                            handles, failure_seen=False
+                        )
+                        if not settled:
+                            settle_timed_out = True
+                            raise RuntimeError(
+                                f"NIXL transfer for room {room} left an "
+                                f"earlier-peer handle running "
+                                f"{NIXL_ERR_SETTLE_TIMEOUT_S}s while deferring "
+                                f"staging"
+                            )
+                        if any_failed:
+                            raise RuntimeError(
+                                f"NIXL transfer encountered ERR on earlier "
+                                f"peer room={room}"
+                            )
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 

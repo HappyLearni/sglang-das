@@ -1695,12 +1695,15 @@ class DeepseekV4AttnBackend(
         # on its own.
         chunked_prefill_size = get_schedule().chunked_prefill_size
         allocator = getattr(model_runner, "token_to_kv_pool_allocator", None)
+        retained_swa_window = (
+            (SWA_WINDOW + self.page_size - 1) // self.page_size
+        ) * self.page_size
         swa_capacity_insufficient = (
             allocator is not None
-            and not getattr(allocator, "swa_uses_ring_buffer", False)
+            and not getattr(allocator, "swa_req_ring", False)
             and 0
             < (getattr(allocator, "size_swa", 0) or 0)
-            < 2 * SWA_WINDOW + self.page_size
+            < retained_swa_window + self.page_size + SWA_WINDOW
         )
         self.skip_mid_chunk_decoder: bool = (
             self.enable_decoder_swa_bounded_replay

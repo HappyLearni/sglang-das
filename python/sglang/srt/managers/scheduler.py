@@ -4546,8 +4546,38 @@ class Scheduler(
             req.external_kv_abort_response_via_chunked = True
             pending[req.rid] = req
         # A later chunk's abort must not replace the earlier response retry owner.
-        for aborted_req in tuple(pending.values()):
-            self._process_external_kv_chunked_abort(aborted_req)
+        pending_reqs = tuple(pending.values())
+        if pending_reqs:
+            all_reduce_fn = getattr(self, "_all_reduce_drain_flags", None)
+            local_drained = [
+                int(
+                    self.prefill_abort_forward_drained(r)
+                    and self.prefill_abort_sender_terminal(r)
+                )
+                for r in pending_reqs
+            ]
+            agreed_drained = (
+                all_reduce_fn(local_drained)
+                if all_reduce_fn is not None
+                else local_drained
+            )
+            local_done = [
+                int(
+                    self._process_external_kv_chunked_abort(
+                        aborted_req, drained=bool(agreed_drained[idx])
+                    )
+                )
+                for idx, aborted_req in enumerate(pending_reqs)
+            ]
+            all_done = (
+                all_reduce_fn(local_done) if all_reduce_fn is not None else local_done
+            )
+            for idx, aborted_req in enumerate(pending_reqs):
+                if all_done[idx]:
+                    pending.pop(aborted_req.rid, None)
+                    if self._pending_chunked_abort_req is aborted_req:
+                        self._pending_chunked_abort_req = None
+                    logger.debug(f"Abort chunked prefill request. {aborted_req.rid=}")
         req = self._pending_chunked_abort_req
         if req is None or req.external_kv_abort_requested or req.rid in pending:
             return
@@ -4587,7 +4617,8 @@ class Scheduler(
                 else (
                     sender is not None
                     and (
-                        (getattr(req, "start_send_idx", 0) or 0) > 0
+                        getattr(req, "pd_early_send_attempted", False)
+                        or (getattr(req, "start_send_idx", 0) or 0) > 0
                         or req.rid
                         in getattr(self, "disagg_prefill_pending_chunk_rids", ())
                         or not self.prefill_abort_forward_drained(req)
@@ -4630,14 +4661,23 @@ class Scheduler(
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
-    def _process_external_kv_chunked_abort(self, req) -> None:
+    def _process_external_kv_chunked_abort(
+        self, req, *, drained: Optional[bool] = None
+    ) -> bool:
         if self.chunked_req is req:
             self.chunked_req = None
         req.external_kv_abort_response_via_chunked = True
-        sender_terminal = self.prefill_abort_sender_terminal(req)
+        if req.external_kv_cleanup_done and req.external_kv_response_sent:
+            return True
+        if drained is None:
+            forward_drained = self.prefill_abort_forward_drained(req)
+            sender_terminal = self.prefill_abort_sender_terminal(req)
+        else:
+            forward_drained = drained
+            sender_terminal = drained
         cleanup_done = self.abort_external_kv_request(
             req,
-            forward_drained=self.prefill_abort_forward_drained(req),
+            forward_drained=forward_drained,
             sender_terminal=sender_terminal,
             abort_message=getattr(
                 req.to_finish or req.finished_reason,
@@ -4648,7 +4688,7 @@ class Scheduler(
             emit_response=False,
         )
         if not cleanup_done:
-            return
+            return False
         if not req.external_kv_response_sent:
             try:
                 self.ipc_channels.send_to_tokenizer.send_output(
@@ -4662,13 +4702,9 @@ class Scheduler(
                 logger.exception(
                     "Chunked abort response failed for %s; will retry", req.rid
                 )
-                return
+                return False
             req.external_kv_response_sent = True
-        self._external_kv_chunked_abort_reqs.pop(req.rid, None)
-        if self._pending_chunked_abort_req is req:
-            self._pending_chunked_abort_req = None
-        logger.debug(f"Abort chunked prefill request. {req.rid=}")
-        return
+        return True
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -5105,11 +5141,8 @@ class Scheduler(
                     == "pending"
                 ):
                     continue
-                if (
-                    not running_batch.return_logprob
-                    and (self.enable_hicache_storage or self.enable_lmcache)
-                    and candidate.return_hidden_states_mode == CaptureHiddenMode.FULL
-                    and not candidate.return_logprob
+                if not running_batch.return_logprob and (
+                    self.enable_hicache_storage or self.enable_lmcache
                 ):
                     prefetch_done = self.tree_cache.check_prefetch_progress(
                         candidate.cache_request_handle
@@ -6473,6 +6506,7 @@ class Scheduler(
         idle = (
             self.running_batch.is_empty()
             and self.chunked_req is None
+            and not getattr(self, "_external_kv_chunked_abort_reqs", None)
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)

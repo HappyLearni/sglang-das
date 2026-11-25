@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.allocator.swa import (
     SWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
@@ -1102,9 +1103,14 @@ class PrefillAdder:
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
-            _rem_tokens = self.memory_budget.available_chunk_tokens(
-                self.rem_chunk_tokens
-            )
+            if isinstance(self.memory_budget, SWAPrefillBudget):
+                _rem_tokens = self.memory_budget.available_chunk_tokens(
+                    self.rem_chunk_tokens, prefix_len=req.prefix_len
+                )
+            else:
+                _rem_tokens = self.memory_budget.available_chunk_tokens(
+                    self.rem_chunk_tokens
+                )
             if _rem_tokens is None:
                 return req
             if self.kv_shard_granule:
@@ -1682,8 +1688,8 @@ class PrefillAdder:
     def _has_undersized_bounded_replay_continuation(
         self, min_replay_chunk: int
     ) -> bool:
-        """True when a non-ring paged SWA pool cannot hold the retained window,
-        one alignment reserve page, and a full-window continuation chunk.
+        """True when a non-ring paged SWA pool cannot hold the retained window
+        pages, one alignment reserve page, and a full-window continuation chunk.
 
         In this regime ``skip_mid_chunk_decoder`` is disabled on the backend so
         chunk 1 populates SWA KV directly and smaller continuation chunks can
@@ -1692,10 +1698,13 @@ class PrefillAdder:
         if not min_replay_chunk:
             return False
         alloc = getattr(self, "token_to_kv_pool_allocator", None)
-        if alloc is None or getattr(alloc, "swa_uses_ring_buffer", False):
+        if alloc is None or getattr(alloc, "swa_req_ring", False):
             return False
         size_swa = getattr(alloc, "size_swa", 0) or 0
-        return 0 < size_swa < 2 * min_replay_chunk + self.page_size
+        retained_window = (
+            (min_replay_chunk + self.page_size - 1) // self.page_size
+        ) * self.page_size
+        return 0 < size_swa < retained_window + self.page_size + min_replay_chunk
 
     def _select_prefill_admission(
         self,

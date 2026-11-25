@@ -271,10 +271,28 @@ class SWAPrefillBudget(PrefillBudget):
     def has_capacity(self) -> bool:
         return super().has_capacity() and self.remaining_swa > 0
 
-    def available_chunk_tokens(self, chunk_limit: int) -> int | None:
+    def available_chunk_tokens(
+        self, chunk_limit: int, *, prefix_len: int = 0
+    ) -> int | None:
         available = min(chunk_limit, int(self.remaining_total))
         if not self.req_ring:
-            available = min(available, int(self.remaining_swa) - self.page_size)
+            rem_swa = int(self.remaining_swa)
+            window = getattr(self.tree_cache, "sliding_window_size", None) or 0
+            retained_window = (
+                self.ceil_paged_tokens(window) if window > 0 else self.page_size
+            )
+            # A minimal paged SWA pool (size_swa <= retained_window + page_size)
+            # has only one free page left after retaining the window; a
+            # page-aligned continuation uses whole pages with no extra alignment
+            # overhead, so do not starve it by subtracting an extra reserve page.
+            if (
+                rem_swa >= self.page_size
+                and prefix_len % self.page_size == 0
+                and 0 < self.allocator.size_swa <= retained_window + self.page_size
+            ):
+                available = min(available, rem_swa // self.page_size * self.page_size)
+            else:
+                available = min(available, rem_swa - self.page_size)
         return available if available > 0 else None
 
     def can_allocate_prefill(

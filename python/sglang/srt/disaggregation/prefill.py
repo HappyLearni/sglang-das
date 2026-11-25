@@ -2002,10 +2002,6 @@ class SchedulerDisaggregationPrefillMixin:
                 req.external_kv_abort_requested = True
                 self._external_kv_abort_rids.add(req.rid)
 
-            if not req.external_kv_pending_chunk_cleared:
-                self.clear_pending_chunk_send(req)
-                req.external_kv_pending_chunk_cleared = True
-
             if not req.external_kv_linker_released:
                 self._release_aborted_request(req)
                 req.external_kv_linker_released = True
@@ -2025,6 +2021,10 @@ class SchedulerDisaggregationPrefillMixin:
                 or not self.prefill_abort_sender_terminal(req)
             ):
                 return False
+
+            if not req.external_kv_pending_chunk_cleared:
+                self.clear_pending_chunk_send(req)
+                req.external_kv_pending_chunk_cleared = True
 
             if not req.external_kv_finish_state_applied:
                 if req.to_finish is not None:
@@ -2417,7 +2417,8 @@ class SchedulerDisaggregationPrefillMixin:
             else getattr(req, "inflight_middle_chunks", 0) == 0
         )
         return bool(
-            (getattr(req, "start_send_idx", 0) or 0) > 0
+            getattr(req, "pd_early_send_attempted", False)
+            or (getattr(req, "start_send_idx", 0) or 0) > 0
             or req.rid in getattr(self, "disagg_prefill_pending_chunk_rids", ())
             or not forward_drained
             or getattr(pd_hidden_state(req), "owner_direct_sent", False)
@@ -2464,6 +2465,7 @@ class SchedulerDisaggregationPrefillMixin:
             or req.rid in failed_rids
             or getattr(req, "pd_client_chunked_abort_pending", False)
             or getattr(req, "pd_result_abort_pending", False)
+            or getattr(req, "pd_abort_retirement_pending", False)
             or (
                 transfer_status is not None
                 and isinstance(req.finished_reason, FINISH_ABORT)
@@ -2487,10 +2489,20 @@ class SchedulerDisaggregationPrefillMixin:
             None,
         )
         undone_reqs: List[Req] = []
+        local_retired = [0] * len(self.disagg_prefill_inflight_queue)
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for idx, (req, poll) in enumerate(
             zip(self.disagg_prefill_inflight_queue, polls)
         ):
+            if (
+                getattr(req, "pd_abort_retirement_pending", False)
+                and req.external_kv_cleanup_done
+            ):
+                # Cleanup already completed on this rank; stay queued until all
+                # peers finish retrying local cleanup/IPC, without re-releasing.
+                local_retired[idx] = 1
+                continue
+
             if getattr(req, "pd_client_chunked_abort_pending", False):
                 if not all_drained[idx]:
                     if (
@@ -2506,20 +2518,31 @@ class SchedulerDisaggregationPrefillMixin:
                             )
                     undone_reqs.append(req)
                     continue
-                self.clear_pending_chunk_send(req)
-                maybe_release_metadata_buffer(
-                    req,
-                    self.req_to_metadata_buffer_idx_allocator,
-                    pd_hidden_pool,
-                )
-                self._release_aborted_request(req)
-                if req.kv.holds_kv or req.kv.holds_mamba:
-                    release_kv_cache(req, self.tree_cache, checkpoint=False)
+                if not req.external_kv_cleanup_done:
+                    self.clear_pending_chunk_send(req)
+                    maybe_release_metadata_buffer(
+                        req,
+                        self.req_to_metadata_buffer_idx_allocator,
+                        pd_hidden_pool,
+                    )
+                    self._release_aborted_request(req)
+                    if req.kv.holds_kv or req.kv.holds_mamba:
+                        release_kv_cache(req, self.tree_cache, checkpoint=False)
+                    req.external_kv_cleanup_done = True
                 abort_msg = getattr(req, "pd_client_chunked_abort_msg", None)
-                if abort_msg is not None:
-                    self.ipc_channels.send_to_tokenizer.send_output(abort_msg, req)
+                if abort_msg is not None and not req.external_kv_response_sent:
+                    try:
+                        self.ipc_channels.send_to_tokenizer.send_output(abort_msg, req)
+                    except Exception:
+                        logger.exception(
+                            "Chunked abort response failed for %s; will retry", req.rid
+                        )
+                        undone_reqs.append(req)
+                        continue
+                    req.external_kv_response_sent = True
                 req.pd_client_chunked_abort_pending = False
                 req.pd_client_chunked_abort_msg = None
+                local_retired[idx] = 1
                 logger.debug(
                     f"Abort chunked prefill request after collective drain. {req.rid=}"
                 )
@@ -2557,10 +2580,13 @@ class SchedulerDisaggregationPrefillMixin:
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
                 req.pd_result_abort_pending = False
                 done_reqs.append(req)
+                local_retired[idx] = 1
                 continue
 
             # Check if this request was marked for external KV abort
-            external_abort_pending = req.rid in self._external_kv_abort_rids
+            external_abort_pending = req.rid in self._external_kv_abort_rids or getattr(
+                req, "pd_abort_retirement_pending", False
+            )
 
             if external_abort_pending:
                 reason = req.to_finish or req.finished_reason
@@ -2575,6 +2601,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 if cleanup_done:
                     done_reqs.append(req)
+                    local_retired[idx] = 1
                 else:
                     undone_reqs.append(req)
                 continue
@@ -2600,6 +2627,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     if cleanup_done:
                         done_reqs.append(req)
+                        local_retired[idx] = 1
                     else:
                         undone_reqs.append(req)
                     continue
@@ -2633,8 +2661,11 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=True)
                     undone_reqs.append(req)
                 elif req.external_kv_abort_requested:
-                    if req.external_kv_cleanup_done:
+                    if req.external_kv_cleanup_done and not getattr(
+                        req, "pd_abort_retirement_pending", False
+                    ):
                         done_reqs.append(req)
+                        local_retired[idx] = 1
                     else:
                         undone_reqs.append(req)
                 elif (
@@ -2655,8 +2686,11 @@ class SchedulerDisaggregationPrefillMixin:
                     # slot so they can prefill, including peers still waiting
                     # for a metadata buffer in the bootstrap queue.
                     self.optimistic_release_and_requeue(req)
+                    local_retired[idx] = 1
                 elif poll != KVPoll.Failed:
                     undone_reqs.append(req)
+                else:
+                    local_retired[idx] = 1
                 continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
@@ -2675,6 +2709,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
+                local_retired[idx] = 1
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
                 drained = bool(all_drained[idx])
@@ -2685,12 +2720,31 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 if cleanup_done:
                     done_reqs.append(req)
+                    local_retired[idx] = 1
                 else:
                     undone_reqs.append(req)
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
                 )
+
+        if needs_drain_consensus:
+            all_retired = self._all_reduce_drain_flags(local_retired)
+            undone_reqs = []
+            for idx, (req, poll) in enumerate(
+                zip(self.disagg_prefill_inflight_queue, polls)
+            ):
+                if all_retired[idx]:
+                    req.pd_abort_retirement_pending = False
+                else:
+                    if (
+                        poll == KVPoll.Failed
+                        or req.rid in failed_rids
+                        or getattr(req, "pd_abort_retirement_pending", False)
+                        or local_retired[idx]
+                    ):
+                        req.pd_abort_retirement_pending = True
+                    undone_reqs.append(req)
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
@@ -2899,12 +2953,26 @@ class SchedulerDisaggregationPrefillMixin:
             req.to_finish = FINISH_ABORT(
                 error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-        forward_drained = (
-            self.prefill_abort_forward_drained(req) if drained is None else drained
-        )
-        sender_terminal = (
-            self.prefill_abort_sender_terminal(req) if drained is None else drained
-        )
+        if drained is None:
+            sender = req.disagg_kv_sender
+            if sender is not None and not req.external_kv_sender_abort_requested:
+                try:
+                    sender.abort()
+                    req.external_kv_sender_abort_requested = True
+                except Exception:
+                    logger.exception(
+                        "Failed to notify KV sender of abort for %s", req.rid
+                    )
+            local_ready = int(
+                self.prefill_abort_forward_drained(req)
+                and self.prefill_abort_sender_terminal(req)
+            )
+            agreed_ready = bool(self._all_reduce_drain_flags([local_ready])[0])
+            forward_drained = agreed_ready
+            sender_terminal = agreed_ready
+        else:
+            forward_drained = drained
+            sender_terminal = drained
         cleanup_done = self.abort_external_kv_request(
             req,
             forward_drained=forward_drained,
@@ -2913,9 +2981,15 @@ class SchedulerDisaggregationPrefillMixin:
             is_insert=False,
             emit_response=True,
         )
-        if not cleanup_done and req not in self.disagg_prefill_inflight_queue:
-            # The bootstrap/waiting queue removes this request after the call.
-            # Keep a strong reference, not just a RID, for the next cleanup pass.
+        if drained is None:
+            all_done = bool(self._all_reduce_drain_flags([int(cleanup_done)])[0])
+            req.pd_abort_retirement_pending = not all_done
+            if not all_done and req not in self.disagg_prefill_inflight_queue:
+                # The bootstrap/waiting queue removes this request after the call.
+                # Keep every TP/CP rank's inflight queue symmetric until all ranks
+                # finish cleanup and IPC retries.
+                self.disagg_prefill_inflight_queue.append(req)
+        elif not cleanup_done and req not in self.disagg_prefill_inflight_queue:
             self.disagg_prefill_inflight_queue.append(req)
 
         if self.metrics_reporter.enable_metrics:
@@ -2941,7 +3015,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.checkpoint_disagg_prefill(req)
                 return True
             if is_aborted(req):
-                self.handle_bootstrap_failure(req)
+                self.handle_bootstrap_failure(req, drained=None)
             return False
         else:
             raise RuntimeError(
@@ -3132,6 +3206,10 @@ class SchedulerDisaggregationPrefillMixin:
             # not a complete physical DCP page. The regular final send covers
             # the full range; only skip this optional early-send optimization.
             return
+        # Mark before the rank-local GPU event readiness check below so that if
+        # one TP/CP rank early-sends while another skips, every rank still takes
+        # the collective abort-drain path on abort.
+        req.pd_early_send_attempted = True
         cached = getattr(req, "disagg_page_indices", None)
         if is_hcu() and self.enable_overlap and not self.enable_staging:
             # Do not let an optional early send fall back to a blocking page
@@ -3519,6 +3597,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
+        req.pd_early_send_attempted = False
         self.clear_pending_chunk_send(req)  # re-sends from scratch
         req.tmp_end_idx = -1
         req.disagg_decode_prefix_len = None
