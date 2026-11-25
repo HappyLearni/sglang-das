@@ -74,3 +74,45 @@ def test_triton_quantize_bitwise_exact_vs_native(shape, monkeypatch):
     assert torch.equal(s_tri, s_ref), (
         f"scale mismatch for {shape}: max_diff={(s_tri - s_ref).abs().max().item()}"
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is None,
+    reason="Requires HCU/ROCm GPU",
+)
+def test_hip_graph_capture_across_row_count_change_zero_recompile(monkeypatch):
+    """Regression test: warming up (1024, 8, 4096) and capturing (1025, 8, 4096)
+    must not trigger a new Triton M-divisibility specialization during capture."""
+    mod = _import_dsv41_int8()
+    mod._TRITON_QUANT_WARMED.clear()
+    monkeypatch.setenv("SGLANG_DSV41_INT8_TRITON_QUANT", "1")
+
+    def _triton_cache_entries():
+        fn = mod._dsv41_int8_quantize_triton_kernel
+        caches = getattr(fn, "device_caches", None)
+        if caches is not None:
+            return sum(len(v[0]) for v in caches.values())
+        return len(getattr(fn, "cache", {}))
+
+    # Warm up M=1024 (m=8192, divisible by 16).
+    x_warm = torch.randn((1024, 8, 4096), dtype=torch.bfloat16, device="cuda")
+    mod.quantize(x_warm)
+    torch.cuda.synchronize()
+    cached_after_warm = _triton_cache_entries()
+
+    # Capture M=1025 (m=8200, not divisible by 16) inside HIP Graph.
+    x_cap = torch.randn((1025, 8, 4096), dtype=torch.bfloat16, device="cuda") * 2.0
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        q_cap, s_cap = mod.quantize(x_cap)
+    g.replay()
+    torch.cuda.synchronize()
+
+    assert _triton_cache_entries() == cached_after_warm, (
+        "Unexpected Triton recompilation triggered during HIP Graph capture"
+    )
+
+    monkeypatch.setenv("SGLANG_DSV41_INT8_TRITON_QUANT", "0")
+    q_ref, s_ref = mod.quantize(x_cap)
+    assert torch.equal(q_cap, q_ref)
+    assert torch.equal(s_cap, s_ref)

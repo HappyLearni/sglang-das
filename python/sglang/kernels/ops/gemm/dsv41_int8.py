@@ -242,7 +242,7 @@ def _triton_quantize_enabled() -> bool:
     return torch.version.hip is not None
 
 
-@triton.jit
+@triton.jit(do_not_specialize=("M",))
 def _dsv41_int8_quantize_triton_kernel(
     X_ptr,
     Q_ptr,
@@ -279,6 +279,23 @@ def _select_triton_quant_block_r(k: int) -> int:
     return 1
 
 
+def _triton_quant_compile_spec(x: torch.Tensor):
+    """Exact Triton compilation signature for _dsv41_int8_quantize_triton_kernel.
+
+    ``M`` is explicitly excluded from Triton specialization via
+    ``do_not_specialize=("M",)`` so changing row counts (e.g. 1024 -> 1025)
+    reuses the compiled binary without triggering JIT compilation during HIP
+    Graph capture. All remaining specialization-affecting attributes (device,
+    dtype, constexpr tile dimensions, and 16-byte input pointer alignment) are
+    included in the warmup key.
+    """
+    k = x.shape[-1]
+    block_r = _select_triton_quant_block_r(k)
+    block_k = triton.next_power_of_2(k)
+    x_aligned16 = (x.data_ptr() % 16) == 0
+    return (x.device.index, x.dtype, k, block_r, block_k, x_aligned16)
+
+
 def _can_use_triton_quantize(x: torch.Tensor) -> bool:
     if not (
         _triton_quantize_enabled()
@@ -289,8 +306,7 @@ def _can_use_triton_quantize(x: torch.Tensor) -> bool:
         and 1 <= x.shape[-1] <= _TRITON_QUANT_MAX_K
     ):
         return False
-    k = x.shape[-1]
-    spec = (k, _select_triton_quant_block_r(k), triton.next_power_of_2(k))
+    spec = _triton_quant_compile_spec(x)
     if torch.cuda.is_current_stream_capturing() and spec not in _TRITON_QUANT_WARMED:
         return False
     return True
@@ -301,7 +317,7 @@ def _quantize_triton(x: torch.Tensor, q: torch.Tensor, scales: torch.Tensor) -> 
     m = x.numel() // k
     block_r = _select_triton_quant_block_r(k)
     block_k = triton.next_power_of_2(k)
-    spec = (k, block_r, block_k)
+    spec = _triton_quant_compile_spec(x)
     grid = (triton.cdiv(m, block_r),)
     _dsv41_int8_quantize_triton_kernel[grid](
         x,
