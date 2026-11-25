@@ -1940,13 +1940,21 @@ def biased_topk_jit_kernel_impl(
     ):
         assert packed_out is None, "aiter topk_gating cannot emit packed ids"
         if router_logits_partials is not None:
-            # ROCm decode router: split-K reduce + gate (+ optional DeepEP finalize) in one launch
+            # ROCm decode router: split-K reduce + gate (+ optional DeepEP finalize) in one launch.
+            # Multiply routed_scaling_factor inside the gate only when the caller expects
+            # topk_weights to carry it (apply_routed_scaling_factor_on_output=True or aiter);
+            # otherwise (e.g. HCU DeepEP) leave weights unscaled so combine scales once.
+            gate_scale = (
+                routed_scaling_factor
+                if (_use_aiter or apply_routed_scaling_factor_on_output)
+                else 1.0
+            )
             return rocm_router_gate(
                 gating_output,
                 correction_bias,
                 topk,
                 renormalize,
-                routed_scaling_factor,
+                gate_scale,
                 partials=router_logits_partials,
                 num_shared=num_shared_append,
                 sqrtsoftplus_log1p=sqrtsoftplus_log1p,
@@ -3364,17 +3372,14 @@ def select_experts(
         and expert_location_dispatch_info is None
         and (
             _use_aiter
-            or (
-                not apply_routed_scaling_factor_on_output
-                and not (
-                    topk_config.sqrtsoftplus_log1p
-                    and _can_use_lightop_deepep_topk_fusion(
-                        router_logits,
-                        top_k,
-                        num_fused_shared_experts,
-                        routing_overridden,
-                        expert_location_dispatch_info,
-                    )
+            or not (
+                topk_config.sqrtsoftplus_log1p
+                and _can_use_lightop_deepep_topk_fusion(
+                    router_logits,
+                    top_k,
+                    num_fused_shared_experts,
+                    routing_overridden,
+                    expert_location_dispatch_info,
                 )
             )
         )
