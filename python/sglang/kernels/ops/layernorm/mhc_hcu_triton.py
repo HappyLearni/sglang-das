@@ -109,10 +109,14 @@ def _hc_bf16x3_reduce_sinkhorn_kernel(
 
     pre = tl.sigmoid(pr * rsqrt * s0 + tl.load(B_ptr + idx4)) + HC_EPS
     post = 2.0 * tl.sigmoid(po * rsqrt * s1 + tl.load(B_ptr + 4 + idx4))
-    cm = tl.exp(cm_p * rsqrt * s2 + tl.load(B_ptr + idx16))
-    for _ in range(SINKHORN_ITERS):
-        cm = cm / (tl.sum(cm, axis=1)[:, None] + HC_EPS)
+    cm = cm_p * rsqrt * s2 + tl.load(B_ptr + idx16)
+    cm = tl.exp(cm - tl.max(cm, axis=1)[:, None])
+    if SINKHORN_ITERS > 0:
+        cm = cm / tl.sum(cm, axis=1)[:, None] + HC_EPS
         cm = cm / (tl.sum(cm, axis=0)[None, :] + HC_EPS)
+        for _ in tl.static_range(SINKHORN_ITERS - 1):
+            cm = cm / (tl.sum(cm, axis=1)[:, None] + HC_EPS)
+            cm = cm / (tl.sum(cm, axis=0)[None, :] + HC_EPS)
 
     tl.store(PRE_ptr + row * 4 + idx4, pre)
     tl.store(POST_ptr + row * 4 + idx4, post)
@@ -155,22 +159,13 @@ def _get_padded_bf16x3_weight(bf16_parts: Sequence[torch.Tensor]) -> torch.Tenso
 
 def _select_launch_config(m: int, k: int) -> Tuple[int, int, int, int] | None:
     """Return (block_m, block_k, split_k, num_warps) for HCU gfx936 MFMA."""
-    if m <= 2048:
-        candidates = (
-            (64, 64, 16, 4),
-            (64, 128, 8, 4),
-            (64, 64, 8, 4),
-            (64, 64, 4, 4),
-            (64, 64, 1, 4),
-        )
-    else:
-        candidates = (
-            (128, 64, 8, 8),
-            (64, 128, 8, 4),
-            (64, 64, 8, 4),
-            (64, 64, 4, 4),
-            (64, 64, 1, 4),
-        )
+    candidates = (
+        (128, 64, 8, 8),
+        (64, 128, 8, 4),
+        (64, 64, 8, 4),
+        (64, 64, 4, 4),
+        (64, 64, 1, 4),
+    )
     for block_m, block_k, split_k, num_warps in candidates:
         if k % (block_k * split_k) == 0:
             return block_m, block_k, split_k, num_warps

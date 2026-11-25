@@ -54,7 +54,10 @@ _use_hcu_hc_mix_stats = _is_hcu and _use_lightop and _hc_mix_stats_opt
 _use_hcu_hc_mix_stats_triton = _is_hcu and get_bool_env_var(
     "SGLANG_HCU_HC_MIX_STATS_TRITON", default="true"
 )
-_HCU_HC_MIX_STATS_TRITON_MIN_TOKENS = 768
+# Empirical BW1000 crossover vs both lightop.hc_mix_stats+hc_split_sinkhorn and
+# hc_mix_stats_sinkhorn_deepgemm/bf16x3: M=768/1024 are faster or break-even on
+# LightOp, while M>=1536 delivers 1.63x-4.30x speedup with Triton MFMA BF16x3.
+_HCU_HC_MIX_STATS_TRITON_MIN_TOKENS = 1536
 _use_aiter_tilelang_mhc = get_bool_env_var(
     "SGLANG_ROCM_USE_AITER_TILELANG_MHC", default="false"
 )
