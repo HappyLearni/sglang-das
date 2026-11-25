@@ -13749,10 +13749,11 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         self.assertFalse(retired)
         sender.abort.assert_called_once()
         self.assertTrue(abort_req.kv.holds_kv)
-        # Must park in rank-local drain queue, never disagg_prefill_inflight_queue
-        # (so asymmetric drain states across TP/CP ranks never split collectives).
-        self.assertEqual(abort_sched.disagg_prefill_inflight_queue, [])
-        self.assertIn(abort_req.rid, abort_sched._local_pd_abort_drain_reqs)
+        # Must park in collective disagg_prefill_inflight_queue and retain
+        # disagg_prefill_pending_chunk_rids until collective drain completes.
+        self.assertEqual(abort_sched.disagg_prefill_inflight_queue, [abort_req])
+        self.assertTrue(abort_req.pd_result_abort_pending)
+        self.assertIn(abort_req.rid, abort_sched.disagg_prefill_pending_chunk_rids)
 
         # 2 & 3) Host-only SWA hit (prefix_len=0, swa_host_hit_length=256) and
         # short continuation chunk (< window) in add_chunked_req must both defer.
@@ -13978,8 +13979,11 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
         from sglang.srt.managers.scheduler import Scheduler
 
-        # 1) Client chunked abort defers KV/metadata release until sender drains,
-        # without touching disagg_prefill_inflight_queue, then retires cleanly.
+        # 1) Client chunked abort parks on disagg_prefill_inflight_queue (keeping
+        # compaction move gate and pending chunk rids closed), then retires via
+        # collective drain once drained.
+        from sglang.srt.disaggregation.utils import unified_memory_disagg_move_gate
+
         drained = {"done": False}
         sender = SimpleNamespace(
             abort=Mock(),
@@ -14003,9 +14007,11 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         c_sched._pending_chunked_abort_req = c_req
         c_sched._external_kv_chunked_abort_reqs = {}
         c_sched._external_kv_abort_rids = set()
-        c_sched._local_pd_abort_drain_reqs = {}
         c_sched.disagg_prefill_pending_chunk_rids = {"client-chunked-pd-abort"}
         c_sched.disagg_prefill_inflight_queue = []
+        c_sched.attn_tp_cpu_group = None
+        c_sched.attn_cp_cpu_group = None
+        c_sched.scheduler_stage_metrics = None
         c_sched.req_to_metadata_buffer_idx_allocator = meta_alloc
         c_sched.tree_cache = Mock()
         c_sched.ipc_channels = SimpleNamespace(
@@ -14014,14 +14020,23 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
             )
         )
         c_sched._release_aborted_request = Mock()
-        with mock.patch(
-            "sglang.srt.managers.scheduler.release_kv_cache"
-        ) as mock_release_kv:
+        move_gate = unified_memory_disagg_move_gate(c_sched)
+        with (
+            mock.patch(
+                "sglang.srt.disaggregation.prefill.release_kv_cache"
+            ) as mock_release_kv,
+            mock.patch(
+                "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+                side_effect=lambda senders, cp, tp: [int(s.poll()) for s in senders],
+            ),
+        ):
             Scheduler.process_pending_chunked_abort(c_sched)
             self.assertIsNone(c_sched.chunked_req)
             self.assertIsNone(c_sched._pending_chunked_abort_req)
-            self.assertEqual(c_sched.disagg_prefill_inflight_queue, [])
-            self.assertIn(c_req.rid, c_sched._local_pd_abort_drain_reqs)
+            self.assertEqual(c_sched.disagg_prefill_inflight_queue, [c_req])
+            self.assertTrue(c_req.pd_client_chunked_abort_pending)
+            self.assertIn(c_req.rid, c_sched.disagg_prefill_pending_chunk_rids)
+            self.assertFalse(move_gate())
             mock_release_kv.assert_not_called()
             meta_alloc.free.assert_not_called()
             self.assertEqual(sent_outputs, [])
@@ -14031,16 +14046,27 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
                     c_sched, c_req
                 )
             )
-            # Once drained, next tick releases metadata + KV and emits client abort once.
+            # Undrained poll keeps the request parked and gate closed.
+            SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+                c_sched
+            )
+            self.assertEqual(c_sched.disagg_prefill_inflight_queue, [c_req])
+            self.assertFalse(move_gate())
+            mock_release_kv.assert_not_called()
+            # Once drained, collective inflight pass releases metadata + KV and emits abort.
             drained["done"] = True
-            Scheduler.process_pending_chunked_abort(c_sched)
+            SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+                c_sched
+            )
             mock_release_kv.assert_called_once()
             meta_alloc.free.assert_called_once_with(2)
             self.assertEqual(len(sent_outputs), 1)
-            self.assertEqual(c_sched._local_pd_abort_drain_reqs, {})
+            self.assertEqual(c_sched.disagg_prefill_inflight_queue, [])
+            self.assertNotIn(c_req.rid, c_sched.disagg_prefill_pending_chunk_rids)
+            self.assertTrue(move_gate())
 
         # 2) NIXL sender reports undrained when _staging_outstanding > 0 and
-        # integer KVPoll.Failed is recognized by _is_aborted_sender_drained.
+        # integer KVPoll.Failed is recognized by prefill_abort_sender_terminal.
         nixl_mgr = NixlKVManager.__new__(NixlKVManager)
         nixl_mgr._staging_outstanding = {99: 1}
         nixl_mgr.check_status = lambda room: KVPoll.Failed
@@ -14051,14 +14077,14 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         self.assertFalse(nixl_sender.is_transfer_drained())
         n_req = SimpleNamespace(rid="nixl-req", disagg_kv_sender=nixl_sender)
         self.assertFalse(
-            SchedulerDisaggregationPrefillMixin._is_aborted_sender_drained(
+            SchedulerDisaggregationPrefillMixin.prefill_abort_sender_terminal(
                 SimpleNamespace(), n_req
             )
         )
         nixl_mgr._staging_outstanding[99] = 0
         self.assertTrue(nixl_sender.is_transfer_drained())
         self.assertTrue(
-            SchedulerDisaggregationPrefillMixin._is_aborted_sender_drained(
+            SchedulerDisaggregationPrefillMixin.prefill_abort_sender_terminal(
                 SimpleNamespace(), n_req
             )
         )
@@ -14208,7 +14234,8 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         ep_cache.sanity_check()
 
         # 8) Idle memory-limited warm hit (6 SWA pages of 64 = 384, window=256,
-        # chunk=512, 64-token hit) drops the warm hit and admits 256 cold tokens.
+        # chunk=512, 64-token hit) drops the warm hit, admits 256 cold tokens,
+        # AND completes all remaining continuation chunks to 512 without stalling.
         tight_cfg = CacheConfig(
             components=(ComponentType.FULL, ComponentType.SWA),
             page_size=64,
@@ -14218,7 +14245,7 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
             decoder_swa_bounded_replay=True,
             swa_gates_prefix_match=True,
         )
-        t_cache, t_alloc, _ = build_fixture(tight_cfg)
+        t_cache, t_alloc, t_pool = build_fixture(tight_cfg)
         t_prompt = list(range(7001, 7513))
         t_p0 = self._alloc_paged(t_alloc, 64)
         self.assertIsNotNone(t_p0)
@@ -14251,8 +14278,598 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         self.assertEqual(t_adder.can_run_list, [t_req])
         self.assertEqual(t_req.prefix_len, 0)
         self.assertEqual(t_req.extend_end, 256)
-        t_cache.unlock(t_req.lock)
+        self.assertIs(t_adder.new_chunked_req, t_req)
+        self.assertIsNotNone(t_pool.alloc([t_req]))
+        first_slots = self._alloc_paged(t_alloc, 256)
+        self.assertIsNotNone(first_slots)
+        t_pool.write((t_req.kv.req_pool_idx, slice(0, 256)), first_slots)
+        t_req.kv.kv_allocated_len = 256
+        t_req.kv.kv_committed_len = 256
+        checkpoint_kv_cache(t_req, t_cache)
+        t_req.prefix_len = 256
+        chunked = t_req
+        for step in range(8):
+            if chunked is None:
+                break
+            chunked.init_next_round_input()
+            next_adder = PrefillAdder(
+                page_size=64,
+                tree_cache=t_cache,
+                token_to_kv_pool_allocator=t_alloc,
+                running_batch=SimpleNamespace(reqs=[]),
+                new_token_ratio=0.7,
+                rem_input_tokens=4096,
+                rem_chunk_tokens=512,
+                num_mixed_decode_tokens=0,
+            )
+            chunked = next_adder.add_chunked_req(chunked)
+            self.assertEqual(next_adder.can_run_list, [t_req])
+            delta = t_req.extend_end - t_req.prefix_len
+            self.assertGreater(delta, 0)
+            if t_alloc.swa_available_size() < delta:
+                t_cache.evict(
+                    EvictParams(swa_num_tokens=delta - t_alloc.swa_available_size())
+                )
+            step_slots = self._alloc_paged(t_alloc, delta)
+            self.assertIsNotNone(step_slots)
+            t_pool.write(
+                (t_req.kv.req_pool_idx, slice(t_req.prefix_len, t_req.extend_end)),
+                step_slots,
+            )
+            t_req.kv.kv_allocated_len = t_req.extend_end
+            t_req.kv.kv_committed_len = t_req.extend_end
+            if chunked is not None:
+                checkpoint_kv_cache(t_req, t_cache)
+                t_req.prefix_len = t_req.extend_end
+        self.assertIsNone(chunked)
+        self.assertEqual(t_req.extend_end, 512)
+        t_req.finished_reason = FINISH_LENGTH(length=0)
+        release_kv_cache(t_req, t_cache, checkpoint=False)
         t_cache.sanity_check()
+
+    def test_round5_collective_pd_drain_nixl_mori_ignore_eos_and_prefetch_lookahead(
+        self,
+    ):
+        """Regression tests for Round-5 findings:
+        1-3. Collective TP/CP MIN drain keeps failed/aborted inflight entries,
+             KV locks, move gate, and is_fully_idle() synchronized across ranks.
+        4. NIXL send_kvcache_mixed and send_kvcache_dcp populate caller handles
+           incrementally so part-2 exceptions still settle part-1 handles.
+        5. MoRI tracks SourceDrainTracker and drains in-progress statuses even
+           when enable_deferred_decode_kv_release=False.
+        6. ignore_eos path rejects a second chunked req when has_chunked_req=True.
+        8. Non-mixing FULL decode look-ahead skips a FULL head with pending L3
+           prefetch without double-polling it, admitting a ready non-FULL req."""
+        import importlib
+        import sys
+        import threading
+        import types
+        from collections import defaultdict
+        from enum import IntEnum
+        from queue import Queue
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, Mock
+
+        import numpy as np
+
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
+        from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+        from sglang.srt.disaggregation.prefill import (
+            SchedulerDisaggregationPrefillMixin,
+        )
+        from sglang.srt.disaggregation.utils import (
+            DisaggregationMode,
+            unified_memory_disagg_move_gate,
+        )
+        from sglang.srt.layers.logits_processor import CaptureHiddenMode
+        from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+        from sglang.srt.managers.scheduler import Scheduler
+
+        # 1-3) Two TP ranks: rank 0 drains early, rank 1 still draining on a
+        # collective KVPoll.Failed inflight entry. Both ranks must retain the
+        # entry until rank 1 also drains, then pop and release on the same tick.
+        rank_drained = [True, False]
+        rank_polls = [KVPoll.Failed, KVPoll.Transferring]
+        rank_scheds = []
+        rank_reqs = []
+        rank_releases = [[], []]
+        for r_idx in range(2):
+            req_r = Req(
+                rid="tp-failed-req",
+                origin_input_text="",
+                origin_input_ids=array("q", list(range(1, 129))),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            )
+            req_r.kv.req_pool_idx = 0
+            req_r.metadata_buffer_index = 4
+            req_r.pending_bootstrap = False
+            req_r.bootstrap_room = 77
+
+            def _make_sender(idx):
+                def _abort():
+                    rank_polls[idx] = KVPoll.Failed
+
+                return SimpleNamespace(
+                    poll=lambda: rank_polls[idx],
+                    is_transfer_drained=lambda: rank_drained[idx],
+                    abort=Mock(side_effect=_abort),
+                    failure_exception=Mock(),
+                )
+
+            req_r.disagg_kv_sender = _make_sender(r_idx)
+            s = Scheduler.__new__(Scheduler)
+            s.disaggregation_mode = DisaggregationMode.PREFILL
+            s.disagg_prefill_inflight_queue = [req_r]
+            s.disagg_prefill_pending_chunk_rids = {"tp-failed-req"}
+            s.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+            s._external_kv_abort_rids = set()
+            s._external_kv_cleanup_rids = set()
+            s.attn_tp_cpu_group = None
+            s.attn_cp_cpu_group = None
+            s.scheduler_stage_metrics = None
+            s.running_batch = SimpleNamespace(is_empty=lambda: True)
+            s.waiting_queue = []
+            s.chunked_req = None
+            s.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+            s.last_batch = None
+            s.enable_overlap = False
+            s.result_queue = []
+            s._pp_microbatches_drained = lambda: True
+            s.grammar_manager = SimpleNamespace(grammar_queue=[])
+            s.enable_hisparse = False
+            s.enable_hierarchical_cache = False
+            s.enable_lmcache = False
+            s.enable_unified_cache_external_linker = False
+            s.enable_dp_attention = False
+            s.req_to_metadata_buffer_idx_allocator = Mock()
+            s.disagg_metadata_buffers = SimpleNamespace(pd_hidden_pool=None)
+            s.tree_cache = Mock()
+            s.output_streamer = Mock()
+            s._release_aborted_request = Mock()
+            s.metrics_reporter = SimpleNamespace(enable_metrics=False)
+            rank_scheds.append(s)
+            rank_reqs.append(req_r)
+
+        def _run_two_rank_inflight_tick():
+            # Shared TP MIN reductions across rank 0 and rank 1.
+            raw_polls = [
+                [
+                    int(r.disagg_kv_sender.poll())
+                    for r in s.disagg_prefill_inflight_queue
+                ]
+                for s in rank_scheds
+            ]
+            self.assertEqual(len(raw_polls[0]), len(raw_polls[1]))
+            reduced_polls = [
+                min(raw_polls[0][i], raw_polls[1][i]) for i in range(len(raw_polls[0]))
+            ]
+            local_drains = [
+                [
+                    int(
+                        SchedulerDisaggregationPrefillMixin.prefill_abort_forward_drained(
+                            s, r
+                        )
+                        and SchedulerDisaggregationPrefillMixin.prefill_abort_sender_terminal(
+                            s, r
+                        )
+                    )
+                    for r in s.disagg_prefill_inflight_queue
+                ]
+                for s in rank_scheds
+            ]
+            reduced_drains = [
+                min(local_drains[0][i], local_drains[1][i])
+                for i in range(len(local_drains[0]))
+            ]
+            for r_idx, s in enumerate(rank_scheds):
+                s._all_reduce_drain_flags = lambda _flags, rd=reduced_drains: list(rd)
+                with (
+                    mock.patch(
+                        "sglang.srt.disaggregation.prefill.get_parallel",
+                        return_value=SimpleNamespace(tp_rank=r_idx),
+                    ),
+                    mock.patch(
+                        "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+                        return_value=list(reduced_polls),
+                    ),
+                    mock.patch(
+                        "sglang.srt.disaggregation.prefill.release_kv_cache",
+                        side_effect=lambda req, tc, checkpoint=False, idx=r_idx: (
+                            rank_releases[idx].append(req.rid)
+                        ),
+                    ),
+                ):
+                    SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+                        s
+                    )
+
+        gate0 = unified_memory_disagg_move_gate(rank_scheds[0])
+        gate1 = unified_memory_disagg_move_gate(rank_scheds[1])
+        # Tick 1: rank 0 drained, rank 1 still transferring/undrained.
+        _run_two_rank_inflight_tick()
+        self.assertEqual(len(rank_scheds[0].disagg_prefill_inflight_queue), 1)
+        self.assertEqual(len(rank_scheds[1].disagg_prefill_inflight_queue), 1)
+        self.assertEqual(rank_releases, [[], []])
+        self.assertFalse(gate0())
+        self.assertFalse(gate1())
+        self.assertFalse(Scheduler.is_fully_idle(rank_scheds[0]))
+        self.assertFalse(Scheduler.is_fully_idle(rank_scheds[1]))
+        # Tick 2: rank 1 finishes draining -> both ranks release & pop together.
+        rank_drained[1] = True
+        _run_two_rank_inflight_tick()
+        self.assertEqual(rank_scheds[0].disagg_prefill_inflight_queue, [])
+        self.assertEqual(rank_scheds[1].disagg_prefill_inflight_queue, [])
+        self.assertEqual(rank_releases, [["tp-failed-req"], ["tp-failed-req"]])
+        self.assertTrue(gate0())
+        self.assertTrue(gate1())
+        self.assertTrue(Scheduler.is_fully_idle(rank_scheds[0]))
+        self.assertTrue(Scheduler.is_fully_idle(rank_scheds[1]))
+
+        # 4) NIXL send_kvcache_mixed and send_kvcache_dcp populate caller
+        # out_handles before part 2 raises, preserving part 1 for settlement.
+        nixl_mgr = NixlKVManager.__new__(NixlKVManager)
+        nixl_mgr._num_slots_src = 16
+        seg0 = SimpleNamespace(
+            start=0, end=1, src_handle="s0", dst_handle="d0", dst_num_slots=16
+        )
+        seg1 = SimpleNamespace(
+            start=1, end=2, src_handle="s1", dst_handle="d1", dst_num_slots=16
+        )
+        nixl_mgr.decode_kv_args_table = {
+            "peer": SimpleNamespace(kv_xfer_segments=[seg0, seg1])
+        }
+        posted = ["handle-part-0", "handle-part-1"]
+        post_idx = {"i": 0}
+
+        def _make_prepped(*_args):
+            h = posted[post_idx["i"]]
+            post_idx["i"] += 1
+            return h
+
+        def _transfer(handle):
+            return "PROC" if handle == "handle-part-0" else "ERR"
+
+        nixl_mgr.agent = SimpleNamespace(
+            make_prepped_xfer=_make_prepped,
+            transfer=_transfer,
+        )
+        mixed_handles = []
+        with self.assertRaises(Exception):
+            nixl_mgr.send_kvcache_mixed(
+                "peer",
+                np.array([0, 1], dtype=np.int32),
+                np.array([0, 1], dtype=np.int32),
+                "notif",
+                out_handles=mixed_handles,
+            )
+        self.assertEqual(mixed_handles, ["handle-part-0"])
+
+        nixl_mgr.src_mem_kind = "VRAM"
+        nixl_mgr.kv_args = SimpleNamespace(num_draft_entries=1, kv_data_ptrs=[100, 200])
+        dcp_calls = {"i": 0}
+
+        def _fake_generic(**_kwargs):
+            if dcp_calls["i"] == 0:
+                dcp_calls["i"] += 1
+                return "dcp-handle-0"
+            raise RuntimeError("dcp part 2 boom")
+
+        nixl_mgr._send_kvcache_generic = _fake_generic
+        dcp_dst_info = SimpleNamespace(
+            dst_homogeneous_mem_kind="VRAM",
+            dcp_token_item_lens=[16, 16],
+            dst_kv_ptrs=[300, 400],
+            dcp_dst_region_indices=[0, 1],
+            gpu_id=0,
+        )
+        dcp_plan = SimpleNamespace(
+            target_src_token_indices=np.array([0], dtype=np.int32),
+            target_dst_token_indices=np.array([0], dtype=np.int32),
+            draft_src_token_indices=np.array([0], dtype=np.int32),
+            draft_dst_token_indices=np.array([0], dtype=np.int32),
+        )
+        dcp_handles = []
+        with self.assertRaises(RuntimeError):
+            nixl_mgr.send_kvcache_dcp(
+                "peer",
+                dcp_dst_info,
+                dcp_plan,
+                "dcp-notif",
+                None,
+                out_handles=dcp_handles,
+            )
+        self.assertEqual(dcp_handles, ["dcp-handle-0"])
+
+        # 5) MoRI tracks SourceDrainTracker and drains in-progress statuses even
+        # when enable_deferred_decode_kv_release=False.
+        try:
+            importlib.import_module("mori.cpp")
+            importlib.import_module("mori.io")
+        except (ImportError, OSError):
+            mori_mod = types.ModuleType("mori")
+            mori_mod.__path__ = []
+            mori_cpp = types.ModuleType("mori.cpp")
+            mori_io = types.ModuleType("mori.io")
+
+            class _FakeStatusCode(IntEnum):
+                SUCCESS = 0
+                IN_PROGRESS = 1
+                FAILED = 2
+
+            mori_cpp.TransferStatus = object
+            for _name in (
+                "BackendType",
+                "EngineDesc",
+                "IOEngine",
+                "IOEngineConfig",
+                "MemoryDesc",
+                "MemoryLocationType",
+                "PollCqMode",
+                "RdmaBackendConfig",
+            ):
+                setattr(mori_io, _name, object)
+            mori_io.StatusCode = _FakeStatusCode
+            mori_mod.cpp = mori_cpp
+            mori_mod.io = mori_io
+            sys.modules["mori"] = mori_mod
+            sys.modules["mori.cpp"] = mori_cpp
+            sys.modules["mori.io"] = mori_io
+
+        from sglang.srt.disaggregation.mori.conn import (
+            MoriKVManager,
+            MoriKVSender,
+            _SubmissionLocal,
+        )
+
+        m_mgr = MoriKVManager.__new__(MoriKVManager)
+        m_mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        m_mgr.enable_deferred_decode_kv_release = False
+        m_mgr.deferred_bootstrap = None
+        m_mgr.request_status = {42: KVPoll.Transferring}
+        m_mgr.transfer_infos = {42: object()}
+        m_mgr.failure_lock = threading.Lock()
+        m_mgr.failure_records = {}
+        m_mgr._num_shards = 1
+        m_mgr._transfer_queues = [Queue()]
+        m_mgr._drain_queue = Queue(maxsize=2)
+        m_mgr._source_drain = SourceDrainTracker()
+        m_mgr._submission_local = _SubmissionLocal()
+        m_mgr._abort_ack_lock = threading.Lock()
+        m_mgr._staging_outstanding = defaultdict(int)
+        m_mgr._deferred_ack_targets = {}
+        m_mgr._wait_poll_ms = 0
+        m_mgr._transfer_timeout_ms = 0
+
+        m_sender = MoriKVSender.__new__(MoriKVSender)
+        m_sender.kv_mgr = m_mgr
+        m_sender.bootstrap_room = 42
+        m_sender.conclude_state = None
+        m_sender._owns_bootstrap_room = True
+
+        m_mgr.add_transfer_request(
+            42,
+            np.array([1], dtype=np.int32),
+            slice(0, 1),
+            False,
+        )
+        self.assertFalse(m_sender.is_transfer_drained())
+        queued_chunk = m_mgr._transfer_queues[0].get_nowait()
+        m_status = MagicMock()
+        m_status.InProgress.return_value = True
+
+        def _submit_and_abort(*_args, **_kwargs):
+            m_sender.abort()
+            return [m_status]
+
+        m_mgr._submit_kv_transfer = _submit_and_abort
+        # Aborted right after submit while status is still InProgress: must
+        # hand off to drainer and remain undrained until status.Wait() finishes.
+        self.assertFalse(m_mgr._process_transfer_chunk(queued_chunk))
+        self.assertEqual(m_sender.poll(), KVPoll.Failed)
+        self.assertFalse(m_sender.is_transfer_drained())
+        m_req = SimpleNamespace(rid="mori-req", disagg_kv_sender=m_sender)
+        self.assertFalse(
+            SchedulerDisaggregationPrefillMixin.prefill_abort_sender_terminal(
+                SimpleNamespace(), m_req
+            )
+        )
+        drain_chunk, drain_statuses = m_mgr._drain_queue.get_nowait()
+        m_mgr._drain_transfer_statuses(drain_chunk, drain_statuses)
+        m_status.Wait.assert_called_once_with()
+        self.assertTrue(m_sender.is_transfer_drained())
+        self.assertTrue(
+            SchedulerDisaggregationPrefillMixin.prefill_abort_sender_terminal(
+                SimpleNamespace(), m_req
+            )
+        )
+
+        # 6) ignore_eos with disabled radix cache respects has_chunked_req=True.
+        ig_adder = PrefillAdder.__new__(PrefillAdder)
+        ig_adder.prefill_max_requests = None
+        ig_adder.tree_cache = SimpleNamespace(disable=True)
+        ig_adder.page_size = 64
+        ig_adder.per_req_token_overhead = 0
+        ig_adder.rem_chunk_tokens = 127
+        ig_adder.new_token_ratio = 0.7
+        ig_adder.is_hybrid_swa = False
+        ig_adder.req_states = None
+        ig_adder.running_batch = SimpleNamespace(reqs=[], batch_size=lambda: 0)
+        ig_adder.prefill_delayer_single_pass = None
+        ig_adder.dllm_config = None
+        ig_adder.can_run_list = []
+        ig_adder.new_chunked_req = None
+        ig_adder.kv_shard_granule = 0
+        ig_adder._mamba_gap_budget_for_req = lambda r: 0
+        ig_adder._request_slot_reserve_for_req = lambda r, **kw: 0
+        ig_adder._swa_new_tokens = lambda r: 1
+        ig_adder._check_prefill_tile_budget = lambda t: None
+        ig_adder._kv_shard_reserve_scratch = lambda **kw: True
+        ig_adder.memory_budget = SimpleNamespace(
+            remaining_current=4096,
+            can_allocate_prefill=lambda **kw: True,
+        )
+        ig_req = Req(
+            rid="ignore-eos-second-chunk",
+            origin_input_text="",
+            origin_input_ids=array("q", list(range(1, 257))),
+            sampling_params=SamplingParams(
+                temperature=0, max_new_tokens=4, ignore_eos=True
+            ),
+        )
+        ig_req.refresh_fill_ids()
+        ig_req.prefix_len = 0
+        self.assertEqual(
+            ig_adder.add_one_req(
+                ig_req, has_chunked_req=True, truncation_align_size=None
+            ),
+            AddReqResult.OTHER,
+        )
+        self.assertIsNone(ig_adder.new_chunked_req)
+        self.assertEqual(ig_adder.can_run_list, [])
+
+        # 8) Non-mixing FULL decode look-ahead skips a FULL head whose L3
+        # prefetch is pending without double-polling it, and does not charge
+        # decode rows against a ready non-FULL request behind it.
+        full_pending = Req(
+            rid="full-pending-l3",
+            origin_input_text="",
+            origin_input_ids=array("q", list(range(1, 17))),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            return_hidden_states=True,
+        )
+        non_full_ready = Req(
+            rid="non-full-ready",
+            origin_input_text="",
+            origin_input_ids=array("q", list(range(17, 33))),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            return_hidden_states=False,
+        )
+        prefetch_calls = []
+
+        def _check_prefetch(handle):
+            prefetch_calls.append(handle.rid)
+            return handle.rid != "full-pending-l3"
+
+        captured_mixed_decode = []
+
+        class _StubAdder:
+            def __init__(self, *args, **kwargs):
+                captured_mixed_decode.append(args[7])
+                self.can_run_list = []
+                self.preempt_list = []
+                self.new_chunked_req = None
+
+            def budget_state(self):
+                return AddReqResult.CONTINUE
+
+            def add_one_req(self, req, **_kwargs):
+                self.can_run_list.append(req)
+                return AddReqResult.OTHER
+
+        decode_reqs = [
+            Req(
+                rid=f"dec-{i}",
+                origin_input_text="",
+                origin_input_ids=array("q", [1, 2]),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=4),
+                return_hidden_states=True,
+            )
+            for i in range(4)
+        ]
+        running_batch = SimpleNamespace(
+            reqs=decode_reqs,
+            batch_is_full=False,
+            return_hidden_states_mode=CaptureHiddenMode.FULL,
+            return_logprob=False,
+            is_empty=lambda: False,
+        )
+        sched = Scheduler.__new__(Scheduler)
+        sched.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        sched.enable_hierarchical_cache = False
+        sched.enable_unified_cache_external_linker = False
+        sched.enable_waiting_queue_dfs_prefetch = False
+        sched.enable_priority_preemption = False
+        sched.is_hybrid_swa = True
+        sched.waiting_queue = [full_pending, non_full_ready]
+        sched.chunked_req = None
+        sched.min_free_slots_delayer = None
+        sched.get_num_allocatable_reqs = lambda *a, **kw: 4
+        sched.policy = SimpleNamespace(calc_priority=lambda *a, **kw: None)
+        sched.chunked_prefill_size = 4
+        sched.dynamic_chunk_sizer = None
+        sched.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                attn_backend=SimpleNamespace(), prefill_aware_swa=False
+            )
+        )
+        sched.enable_lora = False
+        sched.is_mixed_chunk = True
+        sched.tree_cache = SimpleNamespace(
+            isolates_full_hidden_state_batches=lambda: True,
+            buffer_pipeline=None,
+            storage_prefetch_retries=None,
+            check_prefetch_progress=_check_prefetch,
+            pop_prefetch_loaded_span=lambda handle: (0, 0),
+        )
+        sched.get_prefill_adder_class = lambda: _StubAdder
+        sched.page_size = 16
+        sched.token_to_kv_pool_allocator = object()
+        sched.new_token_ratio_tracker = SimpleNamespace(current=0.7)
+        sched.max_prefill_tokens = 128
+        sched.priority_scheduling_preemption_threshold = 0
+        sched.max_prefill_bs = 4
+        sched.max_running_requests = 8
+        sched.dllm_config = None
+        sched.req_to_token_pool = SimpleNamespace()
+        sched.enable_hicache_storage = True
+        sched.enable_lmcache = False
+        sched._prefetch_after_device_hit_loss = lambda req: False
+        sched.truncation_align_size = None
+        sched.model_config = SimpleNamespace()
+        sched.enable_overlap = False
+        sched.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+        sched.hisparse_coordinator = None
+        sched.enable_priority_scheduling = False
+        sched.load_inquirer = SimpleNamespace(_get_num_pending_tokens=lambda **kw: 0)
+        sched.enable_kv_cache_events = False
+        sched.processed_tokens_counter = 0
+        sched.device = "cpu"
+        sched.disaggregation_mode = DisaggregationMode.NULL
+        non_full_ready.init_next_round_input = Mock()
+        fake_batch = SimpleNamespace(
+            reqs=[non_full_ready],
+            prepare_for_extend=Mock(),
+            return_logprob=False,
+            input_embeds=None,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+        )
+        with (
+            mock.patch(
+                "sglang.srt.managers.scheduler.get_memory",
+                return_value=SimpleNamespace(enable_flexkv=False),
+            ),
+            mock.patch(
+                "sglang.srt.managers.scheduler.get_schedule",
+                return_value=SimpleNamespace(prefill_max_requests=None),
+            ),
+            mock.patch(
+                "sglang.srt.managers.scheduler.ScheduleBatch.init_new",
+                return_value=fake_batch,
+            ),
+            mock.patch(
+                "sglang.srt.managers.scheduler.PrefillStats.from_adder",
+                return_value=None,
+            ),
+        ):
+            new_batch, _ = Scheduler._get_new_batch_prefill_raw(
+                sched, None, running_batch
+            )
+        self.assertIs(new_batch, fake_batch)
+        # Decode rows must NOT be charged when skipping the pending FULL head.
+        self.assertEqual(captured_mixed_decode, [0])
+        # Pending FULL head must be polled only ONCE (reused in the main loop).
+        self.assertEqual(prefetch_calls, ["full-pending-l3", "non-full-ready"])
 
 
 if __name__ == "__main__":

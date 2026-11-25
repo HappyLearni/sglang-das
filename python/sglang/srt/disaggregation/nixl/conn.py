@@ -1821,14 +1821,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     plan.target_src_token_indices,
                                     packed_source_by_dcp_rank,
                                 )
-                                handles.extend(
-                                    self.send_kvcache_dcp(
-                                        req.agent_name,
-                                        dst_info,
-                                        plan,
-                                        notif,
-                                        packed_src,
-                                    )
+                                self.send_kvcache_dcp(
+                                    req.agent_name,
+                                    dst_info,
+                                    plan,
+                                    notif,
+                                    packed_src,
+                                    out_handles=handles,
                                 )
                             elif (
                                 self.is_mla_backend
@@ -1852,13 +1851,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                         ),
                                     )
                                 else:
-                                    handles.extend(
-                                        self.send_kvcache_mixed(
-                                            req.agent_name,
-                                            src_prefill_kv_indices,
-                                            chunked_dst_kv_indice,
-                                            notif,
-                                        )
+                                    self.send_kvcache_mixed(
+                                        req.agent_name,
+                                        src_prefill_kv_indices,
+                                        chunked_dst_kv_indice,
+                                        notif,
+                                        out_handles=handles,
                                     )
                             else:
                                 kv_xfer_handle = self.send_kvcache_slice(
@@ -2428,6 +2426,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         plan,
         notif: str,
         packed_src,
+        out_handles: Optional[List[Any]] = None,
     ):
         if self.src_mem_kind is None:
             raise RuntimeError("Missing NIXL source KV memory kind")
@@ -2472,7 +2471,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self.agent.send_notif(peer_name, notif.encode("ascii"))
             return []
 
-        handles = []
+        handles = out_handles if out_handles is not None else []
         for part_idx, (
             src_ptrs,
             part_dst_ptrs,
@@ -2507,6 +2506,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
         notif: str,
+        out_handles: Optional[List[Any]] = None,
     ):
         info = self.decode_kv_args_table[peer_name]
         segments = info.kv_xfer_segments
@@ -2515,7 +2515,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise RuntimeError(f"Missing NIXL mixed KV transfer plan for {peer_name}")
 
         num_parts = len(segments)
-        handles = []
+        handles = out_handles if out_handles is not None else []
         for part_idx, seg in enumerate(segments):
             num_layers = seg.end - seg.start
             src_indices = repeat_indices_over_layers(

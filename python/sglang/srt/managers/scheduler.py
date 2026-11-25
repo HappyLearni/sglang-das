@@ -1404,7 +1404,6 @@ class Scheduler(
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         self._external_kv_chunked_abort_reqs = {}
-        self._local_pd_abort_drain_reqs = {}
         # Track requests marked for external KV abort and cleanup to ensure
         # proper lifecycle and prevent duplicate releases.
         self._external_kv_abort_rids: Set[str] = set()
@@ -4549,9 +4548,6 @@ class Scheduler(
         # A later chunk's abort must not replace the earlier response retry owner.
         for aborted_req in tuple(pending.values()):
             self._process_external_kv_chunked_abort(aborted_req)
-        drain_local = getattr(self, "_drain_local_pd_abort_reqs", None)
-        if drain_local is not None:
-            drain_local()
         req = self._pending_chunked_abort_req
         if req is None or req.external_kv_abort_requested or req.rid in pending:
             return
@@ -4574,32 +4570,47 @@ class Scheduler(
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.clear_pending_chunk_send(req)
             sender = req.disagg_kv_sender
             if sender is not None:
                 try:
                     sender.abort()
+                    req.external_kv_sender_abort_requested = True
                 except Exception:
                     logger.exception(
                         "Failed to notify KV sender of abort for %s", req.rid
                     )
             req.pending_bootstrap = False
-            forward_drained = self.prefill_abort_forward_drained(req)
-            sender_drained = self._is_aborted_sender_drained(req)
-            if not (forward_drained and sender_drained):
-                # Keep KV/metadata owned until in-flight forward chunks and
-                # async RDMA source transfers drain on this rank.
-                req.external_kv_sender_abort_requested = True
+            has_submitted_fn = getattr(self, "_has_submitted_pd_transfer", None)
+            has_submitted = (
+                has_submitted_fn(req)
+                if has_submitted_fn is not None
+                else (
+                    sender is not None
+                    and (
+                        (getattr(req, "start_send_idx", 0) or 0) > 0
+                        or req.rid
+                        in getattr(self, "disagg_prefill_pending_chunk_rids", ())
+                        or not self.prefill_abort_forward_drained(req)
+                    )
+                )
+            )
+            if has_submitted:
+                # Rank-identical handoff to disagg_prefill_inflight_queue so all
+                # TP/CP ranks keep KV/metadata, the unified-memory move gate,
+                # and is_fully_idle() closed until every rank drains together.
+                req.pd_client_chunked_abort_pending = True
+                req.pd_client_chunked_abort_msg = _make_abort_req(
+                    req, finished_reason=finished_reason
+                )
                 self.chunked_req = None
                 self._pending_chunked_abort_req = None
-                local_pd_pending = getattr(self, "_local_pd_abort_drain_reqs", None)
-                if local_pd_pending is None:
-                    local_pd_pending = self._local_pd_abort_drain_reqs = {}
-                local_pd_pending[req.rid] = (req, "client_chunked", finished_reason)
+                if req not in self.disagg_prefill_inflight_queue:
+                    self.disagg_prefill_inflight_queue.append(req)
                 logger.debug(
-                    f"Deferring chunked prefill abort until PD drain. {req.rid=}"
+                    f"Deferring chunked prefill abort to collective PD drain. {req.rid=}"
                 )
                 return
+            self.clear_pending_chunk_send(req)
             maybe_release_metadata_buffer(
                 req,
                 self.req_to_metadata_buffer_idx_allocator,
@@ -4618,42 +4629,6 @@ class Scheduler(
             _make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
-
-    def _drain_local_pd_abort_reqs(self) -> None:
-        """Retire rank-local PD aborts once forward chunks and RDMA source reads
-        have drained, without touching the collective inflight poll queue."""
-        local_pd_pending = getattr(self, "_local_pd_abort_drain_reqs", None)
-        if not local_pd_pending:
-            return
-        pd_hidden_pool = getattr(
-            getattr(self, "disagg_metadata_buffers", None), "pd_hidden_pool", None
-        )
-        for rid, (req, mode, finished_reason) in tuple(local_pd_pending.items()):
-            if not (
-                self.prefill_abort_forward_drained(req)
-                and self._is_aborted_sender_drained(req)
-            ):
-                continue
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator, pd_hidden_pool
-            )
-            if mode == "client_chunked":
-                self._release_aborted_request(req)
-                if req.kv.holds_kv or req.kv.holds_mamba:
-                    release_kv_cache(req, self.tree_cache, checkpoint=False)
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    _make_abort_req(req, finished_reason=finished_reason), req
-                )
-                logger.debug(f"Abort chunked prefill request after drain. {req.rid=}")
-            else:
-                self.tree_cache.finish(
-                    req.cache_request_handle, CacheRequestOutcome.ABORT
-                )
-                if req.kv.holds_kv or req.kv.holds_mamba:
-                    release_kv_cache(req, self.tree_cache, checkpoint=False)
-                req.time_stats.set_completion_time()
-                self.output_streamer.stream_output([req], req.return_logprob)
-            local_pd_pending.pop(rid, None)
 
     def _process_external_kv_chunked_abort(self, req) -> None:
         if self.chunked_req is req:
@@ -5092,23 +5067,62 @@ class Scheduler(
                     running_batch.reqs,
                 )
 
-        first_prefill_candidate = self.chunked_req
-        if first_prefill_candidate is None:
-            for candidate in self.waiting_queue:
-                if self.enable_lora and not self.can_schedule_lora_req(
-                    candidate, running_loras
-                ):
-                    continue
-                first_prefill_candidate = candidate
-                break
-
-        non_mixing_full_decode = (
+        prefetched_ready_by_rid: Dict[str, bool] = {}
+        isolates_full_decode = (
             self.is_mixed_chunk
             and not running_batch.is_empty()
             and getattr(self.tree_cache, "isolates_full_hidden_state_batches", None)
             is not None
             and self.tree_cache.isolates_full_hidden_state_batches()
             and running_batch.return_hidden_states_mode == CaptureHiddenMode.FULL
+        )
+        first_prefill_candidate = self.chunked_req
+        if isolates_full_decode and first_prefill_candidate is None:
+            for candidate in self.waiting_queue:
+                if self.enable_lora and not self.can_schedule_lora_req(
+                    candidate, running_loras
+                ):
+                    continue
+                candidate_beam_width = (
+                    candidate.beam_group.beam_width
+                    if candidate.beam_group is not None
+                    else None
+                )
+                if (
+                    self.get_num_allocatable_reqs(
+                        running_bs,
+                        candidate_beam_width,
+                        running_batch=running_batch,
+                        num_held_rows=0,
+                    )
+                    <= 0
+                    and not self.enable_priority_preemption
+                ):
+                    break
+                if (
+                    self.enable_waiting_queue_dfs_prefetch
+                    and waiting_queue_prefetch_states.get(candidate.rid, "not_tracked")
+                    == "pending"
+                ):
+                    continue
+                if (
+                    not running_batch.return_logprob
+                    and (self.enable_hicache_storage or self.enable_lmcache)
+                    and candidate.return_hidden_states_mode == CaptureHiddenMode.FULL
+                    and not candidate.return_logprob
+                ):
+                    prefetch_done = self.tree_cache.check_prefetch_progress(
+                        candidate.cache_request_handle
+                    )
+                    candidate.time_stats.observe_storage_prefetch_ready(prefetch_done)
+                    prefetched_ready_by_rid[candidate.rid] = prefetch_done
+                    if not prefetch_done:
+                        continue
+                first_prefill_candidate = candidate
+                break
+
+        non_mixing_full_decode = (
+            isolates_full_decode
             and first_prefill_candidate is not None
             and (
                 first_prefill_candidate.return_hidden_states_mode
@@ -5206,10 +5220,13 @@ class Scheduler(
                 abandoned_prefetch = prefetch_state == "terminal"
 
             if self.enable_hicache_storage or self.enable_lmcache:
-                prefetch_done = self.tree_cache.check_prefetch_progress(
-                    req.cache_request_handle
-                )
-                req.time_stats.observe_storage_prefetch_ready(prefetch_done)
+                if req.rid in prefetched_ready_by_rid:
+                    prefetch_done = prefetched_ready_by_rid.pop(req.rid)
+                else:
+                    prefetch_done = self.tree_cache.check_prefetch_progress(
+                        req.cache_request_handle
+                    )
+                    req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue

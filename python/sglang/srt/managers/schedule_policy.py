@@ -1136,6 +1136,7 @@ class PrefillAdder:
         enforce_min_replay_chunk = (
             min_replay_chunk > 0
             and not self._has_undersized_bounded_replay_chunk(min_replay_chunk)
+            and not self._has_undersized_bounded_replay_continuation(min_replay_chunk)
             and req.prefix_len > 0
             and cand_extend_input_len >= min_replay_chunk
         )
@@ -1214,7 +1215,7 @@ class PrefillAdder:
             if host_lock_params is not None:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool = False):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         paged_input = (
             self.ceil_paged_tokens(cand_extend_input_len) + self.per_req_token_overhead
@@ -1326,6 +1327,8 @@ class PrefillAdder:
                 request_slot_reserve=self._request_slot_reserve_for_req(req),
             )
         else:
+            if has_chunked_req or self.new_chunked_req is not None:
+                return AddReqResult.OTHER
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
@@ -1373,7 +1376,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, has_chunked_req=has_chunked_req)
 
         # If the configured chunk budget is permanently smaller than the
         # bounded-replay sliding window, no first chunk after a prefix hit can
@@ -1675,6 +1678,24 @@ class PrefillAdder:
             and init_chunk is not None
             and 0 < init_chunk < min_replay_chunk
         )
+
+    def _has_undersized_bounded_replay_continuation(
+        self, min_replay_chunk: int
+    ) -> bool:
+        """True when a non-ring paged SWA pool cannot hold the retained window,
+        one alignment reserve page, and a full-window continuation chunk.
+
+        In this regime ``skip_mid_chunk_decoder`` is disabled on the backend so
+        chunk 1 populates SWA KV directly and smaller continuation chunks can
+        advance the window without stalling.
+        """
+        if not min_replay_chunk:
+            return False
+        alloc = getattr(self, "token_to_kv_pool_allocator", None)
+        if alloc is None or getattr(alloc, "swa_uses_ring_buffer", False):
+            return False
+        size_swa = getattr(alloc, "size_swa", 0) or 0
+        return 0 < size_swa < 2 * min_replay_chunk + self.page_size
 
     def _select_prefill_admission(
         self,

@@ -1689,12 +1689,23 @@ class DeepseekV4AttnBackend(
         self._source_proj_bufs: Dict[int, list] = {}
         # Per forward: the model stops at the last kv_source layer (see
         # _skips_late_layers), and no tail metadata is built. Disabled when a
-        # fixed chunk size is smaller than SWA_WINDOW because no later chunk
-        # could rebuild a full window on its own.
+        # fixed chunk size is smaller than SWA_WINDOW or a non-ring paged SWA
+        # pool cannot hold the retained window + alignment page + a full-window
+        # continuation chunk, because no later chunk could rebuild a full window
+        # on its own.
         chunked_prefill_size = get_schedule().chunked_prefill_size
+        allocator = getattr(model_runner, "token_to_kv_pool_allocator", None)
+        swa_capacity_insufficient = (
+            allocator is not None
+            and not getattr(allocator, "swa_uses_ring_buffer", False)
+            and 0
+            < (getattr(allocator, "size_swa", 0) or 0)
+            < 2 * SWA_WINDOW + self.page_size
+        )
         self.skip_mid_chunk_decoder: bool = (
             self.enable_decoder_swa_bounded_replay
             and envs.SGLANG_DSV41_SKIP_MID_CHUNK_DECODER.get()
+            and not swa_capacity_insufficient
             and (
                 chunked_prefill_size is None
                 or chunked_prefill_size <= 0

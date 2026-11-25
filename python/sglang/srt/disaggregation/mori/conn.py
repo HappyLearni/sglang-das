@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
@@ -412,10 +413,10 @@ class MoriKVManager(CommonKVManager):
             self._wait_poll_ms = envs.SGLANG_MORI_WAIT_POLL_MS.get()
             self._transfer_timeout_ms = envs.SGLANG_MORI_TRANSFER_TIMEOUT_MS.get()
             self._abort_ack_lock = threading.Lock()
-            if self.enable_deferred_decode_kv_release:
-                self._drain_queue: Queue[
-                    Optional[Tuple[TransferKVChunk, List[TransferStatus]]]
-                ] = Queue(maxsize=self._num_shards)
+            self._source_drain = SourceDrainTracker()
+            self._drain_queue: Queue[
+                Optional[Tuple[TransferKVChunk, List[TransferStatus]]]
+            ] = Queue(maxsize=self._num_shards)
             for shard, queue in enumerate(self._transfer_queues):
                 # Track the thread so teardown() can join it: otherwise every
                 # P->D->P flip that re-enters PREFILL leaks _num_shards threads
@@ -431,17 +432,16 @@ class MoriKVManager(CommonKVManager):
                 )
                 t.start()
                 self._worker_threads.append(t)
-                if self.enable_deferred_decode_kv_release:
-                    t = threading.Thread(
-                        target=self._drain_worker,
-                        daemon=True,
-                        name=(
-                            f"mori-drain-dp{self.system_dp_rank}-"
-                            f"tp{self.attn_tp_rank}-s{shard}"
-                        ),
-                    )
-                    t.start()
-                    self._worker_threads.append(t)
+                t = threading.Thread(
+                    target=self._drain_worker,
+                    daemon=True,
+                    name=(
+                        f"mori-drain-dp{self.system_dp_rank}-"
+                        f"tp{self.attn_tp_rank}-s{shard}"
+                    ),
+                )
+                t.start()
+                self._worker_threads.append(t)
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._start_decode_thread()
@@ -569,7 +569,7 @@ class MoriKVManager(CommonKVManager):
                         )
                     except Exception:
                         pass
-                self._mark_transfer_quiescent(kv_chunk)
+                self._mark_transfer_quiescent(kv_chunk, poisoned=True)
                 continue
 
             if is_quiescent:
@@ -593,7 +593,15 @@ class MoriKVManager(CommonKVManager):
         with self._abort_ack_lock:
             self._staging_outstanding[kv_chunk.room] += 1
 
-    def _mark_transfer_quiescent(self, kv_chunk: TransferKVChunk) -> None:
+    def _mark_transfer_quiescent(
+        self, kv_chunk: TransferKVChunk, *, poisoned: bool = False
+    ) -> None:
+        drain = getattr(self, "_source_drain", None)
+        if drain is not None:
+            if poisoned:
+                drain.poison(kv_chunk.room)
+            else:
+                drain.complete(kv_chunk)
         if not self.enable_deferred_decode_kv_release:
             return
 
@@ -620,12 +628,14 @@ class MoriKVManager(CommonKVManager):
         statuses = self._submit_transfer_chunk(kv_chunk)
 
         if self._should_skip_transfer(room):
-            if not self.enable_deferred_decode_kv_release:
-                return True
-            # Aborted after submit: the writes must still quiesce before the ACK,
-            # but that wait belongs to the drainer, not this shard worker.
-            self._enqueue_transfer_drain(kv_chunk, statuses, None)
-            return False
+            # Aborted after submit: submitted RDMA reads/writes must still
+            # quiesce before source KV or deferred decode KV release.
+            if self.enable_deferred_decode_kv_release or any(
+                status.InProgress() for status in statuses
+            ):
+                self._enqueue_transfer_drain(kv_chunk, statuses, None)
+                return False
+            return True
 
         failure_reason, is_quiescent = self._wait_for_chunk_completion(
             kv_chunk, statuses
@@ -651,12 +661,8 @@ class MoriKVManager(CommonKVManager):
     ) -> Tuple[Optional[str], bool]:
         try:
             failure_reason = self._wait_transfer_completion(statuses)
-            is_quiescent = not self.enable_deferred_decode_kv_release or not any(
-                status.InProgress() for status in statuses
-            )
+            is_quiescent = not any(status.InProgress() for status in statuses)
         except Exception as exc:
-            if not self.enable_deferred_decode_kv_release:
-                raise
             failure_reason = f"Transfer completion failed: {exc!r}"
             is_quiescent = False
 
@@ -665,17 +671,6 @@ class MoriKVManager(CommonKVManager):
         return failure_reason, is_quiescent
 
     def _submit_transfer_chunk(self, kv_chunk: TransferKVChunk) -> List[TransferStatus]:
-        if not self.enable_deferred_decode_kv_release:
-            return self._submit_kv_transfer(
-                kv_chunk.room,
-                kv_chunk.prefill_kv_indices,
-                kv_chunk.index_slice,
-                kv_chunk.is_last_chunk,
-                aux_index=kv_chunk.prefill_aux_index,
-                state_indices=kv_chunk.state_indices,
-                num_kv_tokens=kv_chunk.num_kv_tokens,
-            )
-
         self._submission_local.statuses = []
         try:
             return self._submit_kv_transfer(
@@ -702,12 +697,16 @@ class MoriKVManager(CommonKVManager):
         failure_reason: Optional[str],
     ) -> None:
         # Conclude before the handoff so decode hears now and later chunks skip;
-        # only the ACK waits for the drain.
+        # source KV release and any deferred decode ACK wait for the drain.
         if failure_reason is not None:
             self.conclude_failure(
                 bootstrap_room=kv_chunk.room, failure_reason=failure_reason
             )
-        self._drain_queue.put((kv_chunk, statuses))
+        drain_queue = getattr(self, "_drain_queue", None)
+        if drain_queue is not None:
+            drain_queue.put((kv_chunk, statuses))
+        else:
+            self._drain_transfer_statuses(kv_chunk, statuses)
 
     def _drain_worker(self) -> None:
         while True:
@@ -785,31 +784,33 @@ class MoriKVManager(CommonKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
-        if (
-            bootstrap_room not in self.request_status
-            or self.check_status(bootstrap_room) == KVPoll.Failed
-        ):
-            logger.debug(
-                "Request with bootstrap_room=%s already failed", bootstrap_room
-            )
-            return
+        def _accept_room() -> bool:
+            if (
+                bootstrap_room not in self.request_status
+                or self.check_status(bootstrap_room) == KVPoll.Failed
+            ):
+                logger.debug(
+                    "Request with bootstrap_room=%s already failed", bootstrap_room
+                )
+                return False
+            return bootstrap_room in self.transfer_infos
 
-        if bootstrap_room not in self.transfer_infos:
-            return
-
-        shard_idx = bootstrap_room % self._num_shards
-        self._transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                wait_event=wait_event,
-            )
+        chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
+            wait_event=wait_event,
         )
+        shard_idx = bootstrap_room % self._num_shards
+        drain = getattr(self, "_source_drain", None)
+        if drain is not None:
+            drain.publish(chunk, self._transfer_queues[shard_idx], _accept_room)
+        elif _accept_room():
+            self._transfer_queues[shard_idx].put(chunk)
 
     def _connect_threadsafe(self, endpoint: str, is_ipv6: bool = False):
         """Thread-local ZMQ socket cache with shared Context.
@@ -1034,9 +1035,8 @@ class MoriKVManager(CommonKVManager):
                 logger.exception("Failed to signal mori transfer worker on teardown")
         # Drain workers park in Queue.get() the same way. A full queue means a
         # drainer is stuck in status.Wait(); its join below times out.
-        if (
-            self.disaggregation_mode == DisaggregationMode.PREFILL
-            and self.enable_deferred_decode_kv_release
+        if self.disaggregation_mode == DisaggregationMode.PREFILL and hasattr(
+            self, "_drain_queue"
         ):
             for _ in range(self._num_shards):
                 try:
@@ -2135,6 +2135,20 @@ class MoriKVSender(CommonKVSender):
                 super().clear()
         else:
             super().clear()
+
+    def abort(self) -> None:
+        drain = getattr(self.kv_mgr, "_source_drain", None)
+        if drain is not None:
+            with drain.lock:
+                super().abort()
+        else:
+            super().abort()
+
+    def is_transfer_drained(self) -> bool:
+        drain = getattr(self.kv_mgr, "_source_drain", None)
+        if drain is not None:
+            return drain.drained(self.bootstrap_room)
+        return True
 
     def failure_exception(self):
         if self.conclude_state is None:
