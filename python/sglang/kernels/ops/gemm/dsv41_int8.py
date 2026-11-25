@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 _OPERATORS = (
     "dsv41_int8_quantize_out",
@@ -226,13 +227,105 @@ def _scale_grid(ACC,XS,WS,Y,M:tl.constexpr,N:tl.constexpr,WIDTH:tl.constexpr,BLO
  a=tl.load(ACC+(group*M+row)*WIDTH+local,valid,0).to(tl.float32);xs=tl.load(XS+row);ws=tl.load(WS+col,valid,0);tl.store(Y+row*N+col,(a*xs)*ws,valid)
 
 
+_TRITON_QUANT_MIN_ELEMENTS = 131_072
+_TRITON_QUANT_MAX_K = 8192
+_TRITON_QUANT_WARMED = set()
+
+
+def _triton_quantize_enabled() -> bool:
+    raw = os.environ.get("SGLANG_DSV41_INT8_TRITON_QUANT")
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return torch.version.hip is not None
+
+
+@triton.jit
+def _dsv41_int8_quantize_triton_kernel(
+    X_ptr,
+    Q_ptr,
+    S_ptr,
+    M,
+    K: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_R + tl.arange(0, BLOCK_R)
+    cols = tl.arange(0, BLOCK_K)
+    row_mask = rows < M
+    col_mask = cols < K
+    mask = row_mask[:, None] & col_mask[None, :]
+    offs = rows[:, None].to(tl.int64) * K + cols[None, :].to(tl.int64)
+
+    x = tl.load(X_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    max_abs = tl.max(tl.abs(x), axis=1)
+    absmax = tl.maximum(max_abs, 1.0e-10)
+    scale = tl.div_rn(absmax, 127.0)
+    inv_scale = tl.div_rn(127.0, absmax)
+    q = tl.clamp(libdevice.round(x * inv_scale[:, None]), -127.0, 127.0).to(tl.int8)
+
+    tl.store(Q_ptr + offs, q, mask=mask)
+    tl.store(S_ptr + rows, scale, mask=row_mask)
+
+
+def _select_triton_quant_block_r(k: int) -> int:
+    if k <= 512:
+        return 8
+    if k <= 1024:
+        return 4
+    return 1
+
+
+def _can_use_triton_quantize(x: torch.Tensor) -> bool:
+    if not (
+        _triton_quantize_enabled()
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.ndim >= 2
+        and x.numel() >= _TRITON_QUANT_MIN_ELEMENTS
+        and 1 <= x.shape[-1] <= _TRITON_QUANT_MAX_K
+    ):
+        return False
+    k = x.shape[-1]
+    spec = (k, _select_triton_quant_block_r(k), triton.next_power_of_2(k))
+    if torch.cuda.is_current_stream_capturing() and spec not in _TRITON_QUANT_WARMED:
+        return False
+    return True
+
+
+def _quantize_triton(x: torch.Tensor, q: torch.Tensor, scales: torch.Tensor) -> None:
+    k = x.shape[-1]
+    m = x.numel() // k
+    block_r = _select_triton_quant_block_r(k)
+    block_k = triton.next_power_of_2(k)
+    spec = (k, block_r, block_k)
+    grid = (triton.cdiv(m, block_r),)
+    _dsv41_int8_quantize_triton_kernel[grid](
+        x,
+        q,
+        scales,
+        m,
+        K=k,
+        BLOCK_R=block_r,
+        BLOCK_K=block_k,
+        num_warps=4,
+    )
+    if not torch.cuda.is_current_stream_capturing():
+        _TRITON_QUANT_WARMED.add(spec)
+
+
 def quantize(x):
-    ops = load_native()
     if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError("HIP INT8 quantization requires BF16/FP16/FP32 activations")
     x = x.contiguous()
     q = torch.empty_like(x, dtype=torch.int8)
     scales = torch.empty(x.shape[:-1] + (1,), dtype=torch.float32, device=x.device)
+    if x.numel() == 0:
+        return q, scales
+    if _can_use_triton_quantize(x):
+        _quantize_triton(x, q, scales)
+        return q, scales
+    ops = load_native()
     ops.quantize_out(x, q, scales)
     return q, scales
 
