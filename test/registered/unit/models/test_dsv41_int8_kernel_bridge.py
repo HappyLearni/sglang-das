@@ -19,6 +19,7 @@ class TestInt8KernelBridge(unittest.TestCase):
         for function in [dsv41_int8.backend, dsv41_int8._service_config, dsv41_int8._algorithms, dsv41_int8._scale_schedules]:
             function.cache_clear()
         dsv41_int8._algo_rank_cache.clear()
+        dsv41_int8._device_arch_cache.clear()
 
     def test_backend_lazily_binds_installed_kernel_once(self):
         ops = types.SimpleNamespace(**{name: Mock() for name in dsv41_int8._OPERATORS})
@@ -132,11 +133,99 @@ class TestInt8KernelBridge(unittest.TestCase):
         self.assertEqual(len(dsv41_int8._algo_rank_cache), 0)
         ops.gemm_out.assert_not_called()
 
-    def test_autotune_respects_disable_env_and_explicit_rank(self):
+    def test_autotune_defaults_off_and_respects_opt_in_env(self):
+        with patch.dict(os.environ):
+            os.environ.pop("SGLANG_DSV41_INT8_BLASLT_AUTOTUNE", None)
+            self.assertFalse(dsv41_int8._blaslt_autotune_enabled())
         with patch.dict(os.environ, {"SGLANG_DSV41_INT8_BLASLT_AUTOTUNE": "0"}):
             self.assertFalse(dsv41_int8._blaslt_autotune_enabled())
         with patch.dict(os.environ, {"SGLANG_DSV41_INT8_BLASLT_AUTOTUNE": "1"}):
             self.assertTrue(dsv41_int8._blaslt_autotune_enabled())
+
+    def test_static_gfx936_algo_lookup_and_uncovered_fallback(self):
+        dev = types.SimpleNamespace(type="cuda", index=0)
+        gfx936_props = types.SimpleNamespace(gcnArchName="gfx936:sramecc+:xnack-")
+        gfx942_props = types.SimpleNamespace(gcnArchName="gfx942:sramecc+:xnack-")
+
+        with (
+            patch.dict(os.environ, {"SGLANG_DSV41_INT8_BLASLT_STATIC_ALGO": "1"}),
+            patch.object(torch.cuda, "get_device_properties", return_value=gfx936_props),
+        ):
+            # Covered exact decode M and bucketed prefill M on gfx936.
+            self.assertEqual(
+                dsv41_int8._lookup_default_unpacked_algo_rank(dev, 6, 8, 1024, 4096, 0, False),
+                27,
+            )
+            self.assertEqual(
+                dsv41_int8._lookup_default_unpacked_algo_rank(dev, 4096, 8, 1024, 4096, 0, False),
+                1,
+            )
+            self.assertEqual(
+                dsv41_int8._lookup_default_unpacked_algo_rank(dev, 3000, 8, 1024, 4096, 0, False),
+                1,
+            )
+            self.assertEqual(
+                dsv41_int8._lookup_default_unpacked_algo_rank(dev, 512, 8, 1024, 4096, 0, False),
+                6,
+            )
+            # Uncovered M / shape returns None (caller uses algo_rank=0 without probing).
+            self.assertIsNone(
+                dsv41_int8._lookup_default_unpacked_algo_rank(dev, 13, 8, 1024, 4096, 0, False)
+            )
+            self.assertIsNone(
+                dsv41_int8._lookup_default_unpacked_algo_rank(dev, 16384, 8, 1024, 4096, 0, False)
+            )
+            self.assertIsNone(
+                dsv41_int8._lookup_default_unpacked_algo_rank(dev, 4096, 4, 256, 512, 0, False)
+            )
+
+        # Disabled via env -> returns None.
+        dsv41_int8._device_arch_cache.clear()
+        with (
+            patch.dict(os.environ, {"SGLANG_DSV41_INT8_BLASLT_STATIC_ALGO": "0"}),
+            patch.object(torch.cuda, "get_device_properties", return_value=gfx936_props),
+        ):
+            self.assertIsNone(
+                dsv41_int8._lookup_default_unpacked_algo_rank(dev, 4096, 8, 1024, 4096, 0, False)
+            )
+
+        # Non-gfx936 GPU -> returns None.
+        dsv41_int8._device_arch_cache.clear()
+        with (
+            patch.dict(os.environ, {"SGLANG_DSV41_INT8_BLASLT_STATIC_ALGO": "1"}),
+            patch.object(torch.cuda, "get_device_properties", return_value=gfx942_props),
+        ):
+            self.assertIsNone(
+                dsv41_int8._lookup_default_unpacked_algo_rank(dev, 4096, 8, 1024, 4096, 0, False)
+            )
+
+    def test_project_unpacked_default_uses_static_rank_and_falls_back_to_zero(self):
+        calls = []
+
+        def fake_gemm_out(q, w, raw, groups, tile_n, group_major, algo_rank=0):
+            calls.append(algo_rank)
+            if algo_rank == 1:
+                raise RuntimeError("rank unavailable on this build")
+
+        ops = types.SimpleNamespace(
+            quantize_out=Mock(),
+            gemm_out=fake_gemm_out,
+            scale_out=Mock(),
+        )
+        x = torch.zeros(4096, 8, 4096, dtype=torch.bfloat16)
+        w = torch.zeros(8192, 4096, dtype=torch.int8)
+        s = torch.ones(8192, 1, dtype=torch.float32)
+        with (
+            patch.dict(os.environ),
+            patch.object(dsv41_int8, "load_native", return_value=ops),
+            patch.object(dsv41_int8, "_lookup_default_unpacked_algo_rank", return_value=1),
+            patch.object(dsv41_int8, "_select_unpacked_algo_rank") as mock_autotune,
+        ):
+            os.environ.pop("SGLANG_DSV41_INT8_BLASLT_AUTOTUNE", None)
+            os.environ.pop("SGLANG_DSV41_INT8_BLASLT_ALGO_CONFIG", None)
+            dsv41_int8._project_unpacked(x, w, s, 8, 1024)
+        mock_autotune.assert_not_called()
+        self.assertEqual(calls, [1, 0])
 
     def test_autotune_buckets_large_prefill_t_but_keeps_small_decode_exact(self):
         self.assertEqual(dsv41_int8._autotune_t_bucket(6), 6)
@@ -146,6 +235,25 @@ class TestInt8KernelBridge(unittest.TestCase):
         self.assertEqual(dsv41_int8._autotune_t_bucket(3652), 4096)
         self.assertEqual(dsv41_int8._autotune_t_bucket(3653), 4096)
         self.assertEqual(dsv41_int8._autotune_t_bucket(4096), 4096)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is not None,
+        "HIP/ROCm GPU required",
+    )
+    def test_gpu_static_algo_rank_matches_rank_zero_bitwise(self):
+        device = torch.device("cuda:0")
+        torch.manual_seed(0)
+        x = torch.randn(4096, 8, 4096, device=device, dtype=torch.bfloat16) * 0.25
+        w = torch.randint(-64, 64, (8192, 4096), device=device, dtype=torch.int8)
+        s = torch.randn(8192, 1, device=device, dtype=torch.float32).abs() * 0.01
+        for out_dtype in (torch.bfloat16, torch.float32):
+            y_ref = dsv41_int8._project_unpacked(
+                x, w, s, 8, 1024, output_dtype=out_dtype, algo_rank=0
+            )
+            y_opt = dsv41_int8._project_unpacked(
+                x, w, s, 8, 1024, output_dtype=out_dtype
+            )
+            self.assertTrue(torch.equal(y_ref, y_opt))
 
 if __name__ == "__main__":
     unittest.main()

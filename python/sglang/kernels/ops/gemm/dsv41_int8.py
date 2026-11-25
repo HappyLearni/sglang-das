@@ -88,6 +88,65 @@ _scale_seen = set()
 _algo_rank_cache: OrderedDict = OrderedDict()
 _ALGO_RANK_CACHE_MAX_ENTRIES = 4096
 _TRITON_SCALE_MIN_ELEMENTS = 4_194_304
+_device_arch_cache: dict = {}
+
+# Offline-benchmarked hipBLASLt heuristic algo_rank table for Hygon BW1000
+# (gfx936, DTK 26.04.1) on unpacked DeepSeek-V4.1 INT8 projections.
+# Key: (groups, rank, k, tile_n, group_major) -> (exact_m_map, bucket_m_map).
+# Uncovered shapes or non-gfx936 devices fall back directly to algo_rank=0
+# without online trial-and-error probing.
+_DEFAULT_GFX936_UNPACKED_ALGO_RANKS = {
+    # wo_a (target TP8/DP8): 2.2x-9.8x vs algo_rank=0
+    (8, 1024, 4096, 0, False): (
+        {
+            1: 27, 2: 26, 4: 26, 5: 26, 6: 27, 8: 27, 10: 24, 12: 24, 16: 24,
+            18: 13, 20: 29, 24: 17, 30: 17, 32: 18, 36: 18, 40: 18, 42: 18,
+            48: 20, 64: 20,
+        },
+        {128: 1, 256: 5, 512: 6, 1024: 4, 2048: 2, 4096: 1, 8192: 1},
+    ),
+    # wo_a (draft): 1.9x-24.7x vs algo_rank=0
+    (8, 512, 4096, 0, False): (
+        {
+            1: 4, 2: 4, 4: 3, 6: 4, 8: 4, 12: 2, 16: 3, 24: 31, 32: 11,
+            48: 31, 64: 30,
+        },
+        {128: 6, 256: 15, 512: 23, 1024: 17, 2048: 9, 4096: 8},
+    ),
+    # lm_head (full vocab, DP lm_head): 2.2x-7.0x vs algo_rank=0
+    (1, 129280, 5120, 0, False): (
+        {
+            1: 12, 2: 12, 4: 15, 5: 15, 6: 15, 8: 15, 10: 15, 12: 8, 16: 15,
+            18: 6, 20: 12, 24: 12, 30: 12, 32: 12, 36: 3, 40: 5, 42: 3,
+            48: 3, 64: 5,
+        },
+        {128: 14, 256: 2},
+    ),
+    # lm_head (TP8 sharded): 2.5x-8.0x vs algo_rank=0
+    (1, 16160, 5120, 0, False): (
+        {
+            1: 15, 2: 15, 4: 12, 5: 15, 6: 15, 8: 15, 12: 15, 16: 15,
+            24: 12, 32: 1, 48: 2, 64: 19,
+        },
+        {128: 3, 256: 3, 512: 6, 1024: 3, 2048: 3, 4096: 3},
+    ),
+    # DSPARK markov_head (TP8 sharded): 1.4x-3.0x vs algo_rank=0
+    (1, 16160, 256, 0, False): (
+        {
+            1: 16, 2: 8, 4: 11, 5: 15, 6: 4, 8: 10, 12: 20, 16: 15,
+            24: 11, 32: 15, 48: 11, 64: 3,
+        },
+        {128: 19, 256: 14},
+    ),
+    # DSPARK markov_head (full vocab): 1.5x-3.4x vs algo_rank=0
+    (1, 129280, 256, 0, False): (
+        {
+            1: 18, 2: 18, 4: 16, 5: 16, 6: 1, 8: 16, 12: 1, 16: 1,
+            24: 12, 32: 12, 48: 4, 64: 3,
+        },
+        {128: 4, 256: 19},
+    ),
+}
 
 _DEFAULT_SERVICE_CONFIG = {'algorithms': {'wo_a:1:4096:8:8192:1024:0': '9d220000000000000000000000000000',
                 'wo_a:5:4096:8:8192:1024:0': '9d220000000000000000000000000000',
@@ -276,11 +335,54 @@ def _algorithm_config(path):
         return json.load(f)["algorithms"]
 
 
-def _blaslt_autotune_enabled() -> bool:
-    raw = os.environ.get("SGLANG_DSV41_INT8_BLASLT_AUTOTUNE")
+def _blaslt_static_algo_enabled() -> bool:
+    raw = os.environ.get("SGLANG_DSV41_INT8_BLASLT_STATIC_ALGO")
     if raw is not None:
         return raw.strip().lower() in ("1", "true", "yes", "on")
     return torch.version.hip is not None
+
+
+def _blaslt_autotune_enabled() -> bool:
+    # Online trial-and-error probing is opt-in (for offline tuning / explicit
+    # warmup) so serving requests never pay cold-search spikes or trigger
+    # failing Plan construction on older native wheels.
+    raw = os.environ.get("SGLANG_DSV41_INT8_BLASLT_AUTOTUNE")
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
+def _is_gfx936_device(device) -> bool:
+    if device is None or getattr(device, "type", None) != "cuda":
+        return False
+    idx = device.index
+    cached = _device_arch_cache.get(idx)
+    if cached is not None:
+        return cached
+    try:
+        arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+    except Exception:
+        arch = ""
+    is_match = arch == "gfx936"
+    _device_arch_cache[idx] = is_match
+    return is_match
+
+
+def _lookup_default_unpacked_algo_rank(
+    device, t: int, groups: int, rank: int, k: int, tile_n: int, group_major: bool
+):
+    if not _blaslt_static_algo_enabled() or not _is_gfx936_device(device):
+        return None
+    spec = _DEFAULT_GFX936_UNPACKED_ALGO_RANKS.get(
+        (groups, rank, k, tile_n, bool(group_major))
+    )
+    if spec is None:
+        return None
+    exact_map, bucket_map = spec
+    if t <= 64:
+        return exact_map.get(t)
+    t_bucket = _autotune_t_bucket(t)
+    return bucket_map.get(t_bucket)
 
 
 def _autotune_t_bucket(t: int) -> int:
@@ -371,6 +473,7 @@ def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, 
     t = x.shape[0]
     k = x.shape[-1]
     use_autotune = False
+    used_static = False
     if algo_rank is None:
         config = os.environ.get("SGLANG_DSV41_INT8_BLASLT_ALGO_CONFIG")
         if config:
@@ -379,7 +482,14 @@ def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, 
         elif _blaslt_autotune_enabled():
             use_autotune = True
         else:
-            algo_rank = 0
+            static_rank = _lookup_default_unpacked_algo_rank(
+                x.device, t, groups, rank, k, tile_n, group_major
+            )
+            if static_rank is not None:
+                algo_rank = static_rank
+                used_static = True
+            else:
+                algo_rank = 0
     y = torch.empty((t, groups, rank), device=x.device, dtype=output_dtype)
     if not t:
         return y
@@ -395,7 +505,7 @@ def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, 
     try:
         ops.gemm_out(q, w, raw, groups, tile_n, group_major, algo_rank)
     except RuntimeError:
-        if use_autotune and algo_rank != 0:
+        if (use_autotune or used_static) and algo_rank != 0:
             ops.gemm_out(q, w, raw, groups, tile_n, group_major, 0)
         else:
             raise
