@@ -3802,6 +3802,45 @@ class UnifiedRadixCache(BasePrefixCache):
     def sliding_window_size(self):
         return self._sliding_window_size
 
+    @staticmethod
+    def _req_total_tokens(req) -> int:
+        total = len(getattr(req, "origin_input_ids", ())) + len(
+            getattr(req, "output_ids", ())
+        )
+        fill_ids = getattr(req, "full_untruncated_fill_ids", None)
+        if fill_ids is not None:
+            total = max(total, len(fill_ids))
+        return total
+
+    @staticmethod
+    def _req_reads_decoder_prompt_rows(req, total_tokens: int) -> bool:
+        """Whether ``req`` runs decoder-replay late layers over the whole
+        extend, reading prefix SWA rows that prior bounded-replay prefills
+        never wrote."""
+        if getattr(req, "return_logprob", False):
+            start = getattr(req, "logprob_start_len", -1)
+            if start is not None and 0 <= start < total_tokens:
+                return True
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            get_server_return_hidden_states_mode,
+        )
+        from sglang.srt.runtime_context import get_spec
+
+        is_dspark = (
+            str(getattr(get_spec(), "speculative_algorithm", None) or "").upper()
+            == "DSPARK"
+        )
+        if not is_dspark:
+            if (
+                getattr(req, "return_hidden_states_mode", None)
+                == CaptureHiddenMode.FULL
+            ):
+                return True
+            if get_server_return_hidden_states_mode() == CaptureHiddenMode.FULL:
+                return True
+        return False
+
     def swa_reprefill_tail_tokens(self, req=None) -> int:
         """Tokens at the end of a matched prefix to re-prefill because their SWA
         cannot be reused as is.
@@ -3811,6 +3850,10 @@ class UnifiedRadixCache(BasePrefixCache):
         host pool restores exact contents instead. Decoder SWA bounded replay
         writes late-layer window KV only for an extend's tail rows, so a matched
         prefix may lack it; a streaming turn borrowing its own record has it.
+        When paged SWA gates prefix matching (no encoder replay), a request that
+        runs late layers over the whole extend (prompt logprobs or full hidden
+        capture outside DSpark) cannot safely reuse a prefix whose late-layer
+        SWA was never populated.
         """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -3820,6 +3863,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if swa is None or not swa.sliding_window_size:
             return 0
         if self.decoder_swa_bounded_replay and not self.session.will_lend_record(req):
+            if getattr(swa, "gates_prefix_match", True) and req is not None:
+                total_tokens = self._req_total_tokens(req)
+                if total_tokens > 0 and self._req_reads_decoder_prompt_rows(
+                    req, total_tokens
+                ):
+                    return max(total_tokens, swa.sliding_window_size)
             return swa.sliding_window_size
         if not is_unified_kv_triton():
             return 0

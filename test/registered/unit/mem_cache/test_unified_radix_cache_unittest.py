@@ -156,6 +156,7 @@ class CacheConfig:
     sliding_window_size: Optional[int] = None
     draft_swa_window: int = 0
     decoder_swa_bounded_replay: bool = False
+    swa_gates_prefix_match: bool = True
 
     # Mamba
     enable_mamba_extra_buffer: bool = False
@@ -745,6 +746,7 @@ def build_fixture(
         sliding_window_size=cfg.sliding_window_size,
         draft_swa_window=cfg.draft_swa_window,
         decoder_swa_bounded_replay=cfg.decoder_swa_bounded_replay,
+        swa_gates_prefix_match=cfg.swa_gates_prefix_match,
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
@@ -12605,13 +12607,36 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
 
 
 class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
-    def _matched_len(self, cache, tokens) -> int:
+    @staticmethod
+    def _alloc_paged(allocator, need_size: int):
+        if allocator.page_size == 1:
+            return allocator.alloc(need_size)
+        ps = allocator.page_size
+        aligned = ((need_size + ps - 1) // ps) * ps
+        full_indices = allocator.full_attn_allocator.alloc(aligned)
+        swa_indices = allocator.swa_attn_allocator.alloc(aligned)
+        assert full_indices is not None and swa_indices is not None
+        allocator.set_full_to_swa_mapping(full_indices, swa_indices)
+        return full_indices[:need_size]
+
+    def _matched_len(
+        self,
+        cache,
+        tokens,
+        *,
+        return_logprob: bool = False,
+        logprob_start_len: int = -1,
+        return_hidden_states=False,
+    ) -> int:
         req = Req(
             rid="decoder-swa-bounded-replay",
             origin_input_text="",
             origin_input_ids=array("q", tokens),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            return_logprob=return_logprob,
+            return_hidden_states=return_hidden_states,
         )
+        req.logprob_start_len = logprob_start_len
         req.init_next_round_input(cache)
         return req.prefix_len
 
@@ -12639,6 +12664,177 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
                     cache.swa_reprefill_tail_tokens(), 128 if bounded_replay else 0
                 )
                 self.assertEqual(self._matched_len(cache, prompt), matched)
+
+    def test_tombstoned_swa_prefix_is_rejected_under_bounded_replay(self):
+        """With paged SWA gating prefix match (no encoder replay), a bounded-replay
+        hold-back landing on an SWA tombstone must not match the tombstone."""
+        base_cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            page_size=256,
+            sliding_window_size=128,
+            kv_size=1024,
+            max_context_len=1024,
+            decoder_swa_bounded_replay=True,
+        )
+        for gates_match, short_expected in ((True, 0), (False, 256)):
+            with self.subTest(swa_gates_prefix_match=gates_match):
+                cache, allocator, _ = build_fixture(
+                    replace(base_cfg, swa_gates_prefix_match=gates_match)
+                )
+                cached = list(range(1, 513))
+                value = self._alloc_paged(allocator, len(cached))
+                self.assertIsNotNone(value)
+                # Page 0 ([0..256)) is SWA-evicted (tombstone); Page 1 ([256..512)) is live.
+                allocator.free_swa_segment(value[:256], start_pos=0)
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(array("q", cached)),
+                        value=value[: len(cached)],
+                        component_evicted_seqlens={ComponentType.SWA: 256},
+                    )
+                )
+
+                # Prompt length 632 -> key_limit = 504 -> aligned to 256 (tombstone Page 0).
+                short_prompt = cached + list(range(10001, 10121))
+                self.assertEqual(len(short_prompt), 632)
+                self.assertEqual(self._matched_len(cache, short_prompt), short_expected)
+
+                # Prompt length 640 -> key_limit = 512 -> lands on live SWA Page 1.
+                long_prompt = cached + list(range(20001, 20129))
+                self.assertEqual(len(long_prompt), 640)
+                self.assertEqual(self._matched_len(cache, long_prompt), 512)
+                cache.sanity_check()
+
+    def test_non_gating_swa_matches_short_live_child_after_tombstone(self):
+        """When SWA does not gate prefix matching, a live SWA node shorter than
+        sliding_window_size below a tombstone remains matchable."""
+        cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            page_size=64,
+            sliding_window_size=128,
+            kv_size=1024,
+            max_context_len=1024,
+            decoder_swa_bounded_replay=True,
+            swa_gates_prefix_match=False,
+        )
+        cache, allocator, _ = build_fixture(cfg)
+        cached = list(range(1, 193))
+        value = self._alloc_paged(allocator, len(cached))
+        self.assertIsNotNone(value)
+        allocator.free_swa_segment(value[:128], start_pos=0)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", cached)),
+                value=value[: len(cached)],
+                component_evicted_seqlens={ComponentType.SWA: 128},
+            )
+        )
+        prompt = cached + list(range(10001, 10201))
+        self.assertEqual(self._matched_len(cache, prompt), 192)
+        cache.sanity_check()
+
+    def test_prompt_readers_do_not_reuse_bounded_replay_prefix(self):
+        """Under decoder SWA bounded replay with paged SWA, requests that run
+        late layers over the whole extend (prompt logprobs or full hidden
+        capture outside DSpark) must not reuse prefixes whose late-layer SWA
+        was never written."""
+        from sglang.srt.runtime_context import get_context
+
+        base_cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            page_size=256,
+            sliding_window_size=128,
+            kv_size=1024,
+            max_context_len=1024,
+            decoder_swa_bounded_replay=True,
+        )
+        cached = list(range(1, 257))
+        prompt = cached + list(range(10001, 10377))
+        self.assertEqual(len(prompt), 632)
+
+        # Paged SWA (swa_gates_prefix_match=True): prompt readers force prefix_len=0.
+        cache, allocator, _ = build_fixture(
+            replace(base_cfg, swa_gates_prefix_match=True)
+        )
+        value = self._alloc_paged(allocator, len(cached))
+        self.assertIsNotNone(value)
+        cache.insert(
+            InsertParams(key=RadixKey(array("q", cached)), value=value[: len(cached)])
+        )
+        self.assertEqual(self._matched_len(cache, prompt), 256)
+        # Output-only logprobs keep normal prefix reuse.
+        self.assertEqual(
+            self._matched_len(cache, prompt, return_logprob=True, logprob_start_len=-1),
+            256,
+        )
+        self.assertEqual(
+            self._matched_len(
+                cache, prompt, return_logprob=True, logprob_start_len=len(prompt)
+            ),
+            256,
+        )
+        # Prompt logprobs (even just the final prompt token) trigger whole_extend.
+        self.assertEqual(
+            self._matched_len(
+                cache, prompt, return_logprob=True, logprob_start_len=256
+            ),
+            0,
+        )
+        self.assertEqual(
+            self._matched_len(
+                cache, prompt, return_logprob=True, logprob_start_len=len(prompt) - 1
+            ),
+            0,
+        )
+        # Full hidden-state capture triggers whole_extend outside DSpark.
+        self.assertEqual(
+            self._matched_len(cache, prompt, return_hidden_states=True),
+            0,
+        )
+        override = get_context().override_server_args(enable_return_hidden_states=True)
+        override.install()
+        try:
+            self.assertEqual(self._matched_len(cache, prompt), 0)
+        finally:
+            override.restore()
+        override_dspark = get_context().override_server_args(
+            speculative_algorithm="DSPARK"
+        )
+        override_dspark.install()
+        try:
+            self.assertEqual(self._matched_len(cache, prompt), 256)
+            self.assertEqual(
+                self._matched_len(cache, prompt, return_hidden_states=True), 256
+            )
+            self.assertEqual(
+                self._matched_len(
+                    cache, prompt, return_logprob=True, logprob_start_len=256
+                ),
+                0,
+            )
+        finally:
+            override_dspark.restore()
+        cache.sanity_check()
+
+        # Encoder replay (swa_gates_prefix_match=False): replay populates all
+        # layers in RequestWindow, so prompt-logprob hits stay enabled.
+        cache_enc, allocator_enc, _ = build_fixture(
+            replace(base_cfg, swa_gates_prefix_match=False)
+        )
+        value_enc = self._alloc_paged(allocator_enc, len(cached))
+        self.assertIsNotNone(value_enc)
+        cache_enc.insert(
+            InsertParams(
+                key=RadixKey(array("q", cached)), value=value_enc[: len(cached)]
+            )
+        )
+        self.assertEqual(
+            self._matched_len(
+                cache_enc, prompt, return_logprob=True, logprob_start_len=256
+            ),
+            256,
+        )
+        cache_enc.sanity_check()
 
 
 if __name__ == "__main__":

@@ -248,8 +248,7 @@ def match_kv_cache(
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
             key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
-            return_full_match=return_full_match
-            or bool(tree_cache.swa_reprefill_tail_tokens()),
+            return_full_match=return_full_match,
             cow_mamba=cow_mamba,
             req=req,
         )
