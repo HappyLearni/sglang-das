@@ -2458,9 +2458,15 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
         else:
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
-            if _is_hip and not _is_hcu:
+            if _is_hip and not overlap_layer_split_prefetch:
                 q, q_lora, fuse_q_rope = _hip.compute_q_b(
-                    self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
+                    self,
+                    q_lora,
+                    q_for_wqb,
+                    positions,
+                    q_out,
+                    unified,
+                    use_cp or forward_batch.encoder_swa_replay,
                 )
             elif not overlap_layer_split_prefetch:
                 q = self._compute_q_b(q_for_wqb, positions, q_out)

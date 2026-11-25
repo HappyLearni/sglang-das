@@ -24,9 +24,11 @@ from sglang.srt.layers.fused_rms_quant import (
     rms_norm_fp8_operand,
     rms_norm_int8_operand,
 )
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.models.deepseek_v4_replay_tail import in_replay_tail_graph
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense as gfx95_dense
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (  # noqa: F401  deepseek_v4 reaches apply_attention_mhc through this module
     MHC_HIDDEN_SIZE,
@@ -35,7 +37,7 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (  # noq
     norm_hosting_sinkhorn_operand,
 )
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_gfx95_supported, is_hcu
+from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hcu
 
 live_rows = gfx95_dense.live_rows
 wo_a_fp8_grid_matmul = gfx95_dense.wo_a_fp8_grid_matmul
@@ -181,6 +183,25 @@ def wq_b_unroped(attn, q) -> torch.Tensor:
     return q.view(-1, attn.n_local_heads, attn.head_dim)
 
 
+def _hcu_kv_pool_supports_fused_q_rope(attn) -> bool:
+    if not (
+        _is_hcu
+        and get_bool_env_var("SGLANG_HCU_FUSE_Q_ROPE", "true")
+        and getattr(attn, "head_dim", None) == 512
+        and getattr(attn, "rope_head_dim", None) == 64
+        and not in_replay_tail_graph()
+    ):
+        return False
+    pool = get_token_to_kv_pool()
+    if pool is None:
+        return False
+    return (
+        not getattr(pool, "is_bf16_attention_kv_cache", False)
+        and not getattr(pool, "uniform_fp8", False)
+        and not hasattr(pool, "_owns_swa_layer_id")
+    )
+
+
 def compute_q_b(
     attn,
     q_lora: torch.Tensor,
@@ -193,14 +214,15 @@ def compute_q_b(
     """attn._compute_q_b(q_for_wqb, positions, q_out) as (q, the q_lora the indexer reads,
     whether the K norm-rope-store launch ropes q). The indexer takes the fused operand:
     its wq_b would re-round onto the same grid."""
-    fuse_q_rope = _is_gfx95_supported and fuses_q_rope_into_k_store(
-        attn, q_out, unified=unified, use_cp=use_cp
-    )
+    fuse_q_rope = (
+        _is_gfx95_supported or _hcu_kv_pool_supports_fused_q_rope(attn)
+    ) and fuses_q_rope_into_k_store(attn, q_out, unified=unified, use_cp=use_cp)
     if fuse_q_rope:
         q = wq_b_unroped(attn, q_for_wqb)
     else:
         q = attn._compute_q_b(q_for_wqb, positions, q_out)
-    return q, q_for_wqb, fuse_q_rope
+    indexer_q_lora = q_lora if _is_hcu else q_for_wqb
+    return q, indexer_q_lora, fuse_q_rope
 
 
 def skip_head_pad(attn) -> bool:
