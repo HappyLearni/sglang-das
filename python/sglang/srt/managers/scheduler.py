@@ -1404,6 +1404,7 @@ class Scheduler(
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         self._external_kv_chunked_abort_reqs = {}
+        self._local_pd_abort_drain_reqs = {}
         # Track requests marked for external KV abort and cleanup to ensure
         # proper lifecycle and prevent duplicate releases.
         self._external_kv_abort_rids: Set[str] = set()
@@ -4548,6 +4549,9 @@ class Scheduler(
         # A later chunk's abort must not replace the earlier response retry owner.
         for aborted_req in tuple(pending.values()):
             self._process_external_kv_chunked_abort(aborted_req)
+        drain_local = getattr(self, "_drain_local_pd_abort_reqs", None)
+        if drain_local is not None:
+            drain_local()
         req = self._pending_chunked_abort_req
         if req is None or req.external_kv_abort_requested or req.rid in pending:
             return
@@ -4567,24 +4571,89 @@ class Scheduler(
         prepare_abort(req, reason.message, reason.status_code)
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.to_finish = None
+        # A client abort leaves the message to the tokenizer.
+        finished_reason = req.discard_output_reason and reason.to_json()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
-            req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
+            sender = req.disagg_kv_sender
+            if sender is not None:
+                try:
+                    sender.abort()
+                except Exception:
+                    logger.exception(
+                        "Failed to notify KV sender of abort for %s", req.rid
+                    )
             req.pending_bootstrap = False
+            forward_drained = self.prefill_abort_forward_drained(req)
+            sender_drained = self._is_aborted_sender_drained(req)
+            if not (forward_drained and sender_drained):
+                # Keep KV/metadata owned until in-flight forward chunks and
+                # async RDMA source transfers drain on this rank.
+                req.external_kv_sender_abort_requested = True
+                self.chunked_req = None
+                self._pending_chunked_abort_req = None
+                local_pd_pending = getattr(self, "_local_pd_abort_drain_reqs", None)
+                if local_pd_pending is None:
+                    local_pd_pending = self._local_pd_abort_drain_reqs = {}
+                local_pd_pending[req.rid] = (req, "client_chunked", finished_reason)
+                logger.debug(
+                    f"Deferring chunked prefill abort until PD drain. {req.rid=}"
+                )
+                return
+            maybe_release_metadata_buffer(
+                req,
+                self.req_to_metadata_buffer_idx_allocator,
+                getattr(
+                    getattr(self, "disagg_metadata_buffers", None),
+                    "pd_hidden_pool",
+                    None,
+                ),
+            )
         self._release_aborted_request(req)
         release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        # A client abort leaves the message to the tokenizer.
-        finished_reason = req.discard_output_reason and reason.to_json()
         self.ipc_channels.send_to_tokenizer.send_output(
             _make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
+    def _drain_local_pd_abort_reqs(self) -> None:
+        """Retire rank-local PD aborts once forward chunks and RDMA source reads
+        have drained, without touching the collective inflight poll queue."""
+        local_pd_pending = getattr(self, "_local_pd_abort_drain_reqs", None)
+        if not local_pd_pending:
+            return
+        pd_hidden_pool = getattr(
+            getattr(self, "disagg_metadata_buffers", None), "pd_hidden_pool", None
+        )
+        for rid, (req, mode, finished_reason) in tuple(local_pd_pending.items()):
+            if not (
+                self.prefill_abort_forward_drained(req)
+                and self._is_aborted_sender_drained(req)
+            ):
+                continue
+            maybe_release_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator, pd_hidden_pool
+            )
+            if mode == "client_chunked":
+                self._release_aborted_request(req)
+                if req.kv.holds_kv or req.kv.holds_mamba:
+                    release_kv_cache(req, self.tree_cache, checkpoint=False)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(req, finished_reason=finished_reason), req
+                )
+                logger.debug(f"Abort chunked prefill request after drain. {req.rid=}")
+            else:
+                self.tree_cache.finish(
+                    req.cache_request_handle, CacheRequestOutcome.ABORT
+                )
+                if req.kv.holds_kv or req.kv.holds_mamba:
+                    release_kv_cache(req, self.tree_cache, checkpoint=False)
+                req.time_stats.set_completion_time()
+                self.output_streamer.stream_output([req], req.return_logprob)
+            local_pd_pending.pop(rid, None)
 
     def _process_external_kv_chunked_abort(self, req) -> None:
         if self.chunked_req is req:
@@ -5013,6 +5082,26 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        if self.enable_lora:
+            running_loras = {
+                req.lora_id for req in running_batch.reqs if not req.finished()
+            }
+            if self.lora_drainer:
+                self.lora_drainer.update_draining_state(
+                    self.waiting_queue,
+                    running_batch.reqs,
+                )
+
+        first_prefill_candidate = self.chunked_req
+        if first_prefill_candidate is None:
+            for candidate in self.waiting_queue:
+                if self.enable_lora and not self.can_schedule_lora_req(
+                    candidate, running_loras
+                ):
+                    continue
+                first_prefill_candidate = candidate
+                break
+
         non_mixing_full_decode = (
             self.is_mixed_chunk
             and not running_batch.is_empty()
@@ -5020,18 +5109,12 @@ class Scheduler(
             is not None
             and self.tree_cache.isolates_full_hidden_state_batches()
             and running_batch.return_hidden_states_mode == CaptureHiddenMode.FULL
+            and first_prefill_candidate is not None
             and (
-                (
-                    self.chunked_req is not None
-                    and self.chunked_req.return_hidden_states_mode
-                    != CaptureHiddenMode.FULL
-                )
-                or (
-                    self.chunked_req is None
-                    and bool(self.waiting_queue)
-                    and self.waiting_queue[0].return_hidden_states_mode
-                    != CaptureHiddenMode.FULL
-                )
+                first_prefill_candidate.return_hidden_states_mode
+                != CaptureHiddenMode.FULL
+                or first_prefill_candidate.return_logprob
+                or running_batch.return_logprob
             )
         )
         adder = self.get_prefill_adder_class()(
@@ -5064,17 +5147,8 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            running_loras = {
-                req.lora_id for req in running_batch.reqs if not req.finished()
-            }
             # Account for LoRAs that are already loaded in the adder, such as chunked requests
             running_loras.update(req.lora_id for req in adder.can_run_list)
-
-            if self.lora_drainer:
-                self.lora_drainer.update_draining_state(
-                    self.waiting_queue,
-                    running_batch.reqs,
-                )
 
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
@@ -5225,8 +5299,13 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
+        launched_chunked_req = (
+            self.chunked_req
+            if (self.chunked_req is not None and self.chunked_req in can_run_set)
+            else None
+        )
+        if launched_chunked_req is not None:
+            launched_chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -5239,11 +5318,11 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            chunked_req=self.chunked_req,
+            chunked_req=launched_chunked_req,
         )
 
         new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+            launched_chunked_req is None or len(can_run_list) != 1
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
 

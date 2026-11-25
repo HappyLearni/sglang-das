@@ -75,7 +75,10 @@ class DecodeHiCachePreallocMixin:
 
         l3_storage_hit_length = 0
         last_host_node = None
-        if self.scheduler.enable_decode_hicache:
+        if (
+            self.scheduler.enable_decode_hicache
+            and getattr(req, "positional_embed_overrides", None) is None
+        ):
             last_host_node = result.last_host_node
             if self.tree_cache.is_backuped(last_host_node) or self.tree_cache.is_root(
                 last_host_node

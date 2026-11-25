@@ -57,6 +57,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
+from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
 
@@ -560,6 +561,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._source_drain = SourceDrainTracker()
         self.transfer_source_rank = (
             self.kv_args.pp_rank * get_parallel().tp_size + self.kv_args.engine_rank
         )
@@ -1654,6 +1656,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     if self.enable_deferred_decode_kv_release:
                         # clear() keeps the target while a chunk is counted.
                         self._maybe_ack_drained_abort(room)
+                    if (drain := getattr(self, "_source_drain", None)) is not None:
+                        drain.complete(kv_chunk)
                     continue
 
                 # Counted at dequeue, before the status check, so
@@ -1669,6 +1673,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(room)
+                    if (drain := getattr(self, "_source_drain", None)) is not None:
+                        drain.complete(kv_chunk)
                     continue
 
                 room_transfer_infos = self.transfer_infos.get(room)
@@ -1681,6 +1687,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self._staging_outstanding.pop(room, None)
                     if self.enable_deferred_decode_kv_release:
                         self._maybe_ack_drained_abort(room)
+                    if (drain := getattr(self, "_source_drain", None)) is not None:
+                        drain.complete(kv_chunk)
                     continue
 
                 # Lazily build a per-worker staging strategy bound to this
@@ -1975,6 +1983,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         for k in list(self._staging_ctx.prefetch_requested):
                             if k[0] == room:
                                 self._staging_ctx.prefetch_requested.discard(k)
+                if (drain := getattr(self, "_source_drain", None)) is not None:
+                    drain.complete(kv_chunk)
             except Exception as e:
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
@@ -2001,6 +2011,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         self._staging_outstanding[room] -= 1
                     if self.enable_deferred_decode_kv_release:
                         self._maybe_ack_drained_abort(room)
+                    if (drain := getattr(self, "_source_drain", None)) is not None:
+                        drain.complete(kv_chunk)
                 else:
                     # A handle can still write into the decode's KV pages, so
                     # leave the room to the decode's waiting timeout rather
@@ -2011,6 +2023,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # drain ACK can follow; discard the target and fall back to
                     # the timeout.
                     self.poison_deferred_ack_room(room)
+                    if (drain := getattr(self, "_source_drain", None)) is not None:
+                        drain.poison(room)
                 # Settle first; NIXL 1.3.0 undoes a reload when an old handle fails.
                 # room_transfer_infos survives the sender's clear() of this room.
                 self._reload_invalidated_peers(room_transfer_infos or {})
@@ -3426,18 +3440,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             info.dst_port for info in self.transfer_infos[bootstrap_room].values()
         )
         shard_idx = session_port_sum % len(self.transfer_queues)
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                chunk_id=chunk_id,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-            )
+        chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            chunk_id=chunk_id,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
         )
+        drain = getattr(self, "_source_drain", None)
+        if drain is not None:
+            drain.publish(
+                chunk,
+                self.transfer_queues[shard_idx],
+                lambda: self.request_status.get(bootstrap_room) != KVPoll.Failed,
+            )
+        else:
+            self.transfer_queues[shard_idx].put(chunk)
         return None
 
     def update_transfer_status(self):
@@ -3814,6 +3835,23 @@ class NixlKVSender(CommonKVSender):
 
     def poll_pp_consensus(self) -> KVPoll:
         return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
+
+    def is_transfer_drained(self) -> bool:
+        if self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0:
+            return False
+        drain = getattr(self.kv_mgr, "_source_drain", None)
+        if drain is not None:
+            return drain.drained(self.bootstrap_room)
+        return True
+
+    def abort(self):
+        # Serialize Failed publication against chunk enqueue (mirror Mooncake).
+        drain = getattr(self.kv_mgr, "_source_drain", None)
+        if drain is not None:
+            with drain.lock:
+                super().abort()
+        else:
+            super().abort()
 
     def _poll_with_status(self, check_status) -> KVPoll:
         if self._send_failed:

@@ -1132,7 +1132,7 @@ class PrefillAdder:
             _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
-        min_replay_chunk = self._min_bounded_replay_chunk_tokens(req)
+        min_replay_chunk = self._min_bounded_replay_continuation_chunk_tokens(req)
         enforce_min_replay_chunk = (
             min_replay_chunk > 0
             and not self._has_undersized_bounded_replay_chunk(min_replay_chunk)
@@ -1394,25 +1394,7 @@ class PrefillAdder:
                 > self.init_chunk_tokens
             )
         ):
-            if (
-                isinstance(self.tree_cache, UnifiedRadixCache)
-                and self.tree_cache.buffer_pipeline is not None
-                and getattr(req, "cache_request_handle", None) is not None
-            ):
-                self.tree_cache.buffer_pipeline.release_staged_hold(
-                    req.cache_request_handle,
-                    reason="bounded_replay_undersized_chunk",
-                )
-            root = self.tree_cache.root_node_handle()
-            req.prefix_len = 0
-            req.last_node = root
-            req.last_host_node = root
-            req.best_match_node = root
-            req.host_hit_length = 0
-            req.swa_host_hit_length = 0
-            req.mamba_host_hit_length = 0
-            req.staged_prefetch_plan = None
-            req.kv.cache_protected_len = 0
+            self._reset_req_to_cold_start(req)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1421,162 +1403,196 @@ class PrefillAdder:
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
-        total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
-        # Reserve request and load-back state slots before init_load_back binds
-        # the request slot. Reuse this reservation when committing admission.
-        mamba_gap_reserve = self._mamba_gap_budget_for_req(req, include_host_hit=True)
-        total_tokens += mamba_gap_reserve
-        if self.rem_mamba_slots is not None:
-            required_mamba_slots = mamba_gap_reserve // self._mamba_slot_cost
-            if required_mamba_slots > self.rem_mamba_slots:
-                if (
-                    isinstance(self.tree_cache, UnifiedRadixCache)
-                    and self.tree_cache.buffer_pipeline is not None
-                ):
-                    self.tree_cache.buffer_pipeline.defer_staged_admission(req, "mamba")
-                return AddReqResult.NO_TOKEN
-        request_slot_reserve = self._request_slot_reserve_for_req(req)
-        total_tokens += request_slot_reserve
-
-        # The temporary pin excludes this prefix from the evictable budget.
-        # Selection itself neither allocates slots nor materializes host hits.
-        with self._lock_node(req.last_node):
-            admission = self._select_prefill_admission(
-                req,
-                total_tokens=total_tokens,
-                host_hit_length=req.host_hit_length,
-                swa_host_hit_length=req.swa_host_hit_length,
-                truncation_align_size=truncation_align_size,
-                has_chunked_req=has_chunked_req,
+        is_idle = not self.can_run_list and (
+            self.running_batch is None or not self.running_batch.reqs
+        )
+        for attempt in range(2):
+            cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+            total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
+            # Reserve request and load-back state slots before init_load_back binds
+            # the request slot. Reuse this reservation when committing admission.
+            mamba_gap_reserve = self._mamba_gap_budget_for_req(
+                req, include_host_hit=True
             )
-            if isinstance(admission, AddReqResult):
-                if admission is AddReqResult.NO_TOKEN:
-                    self._defer_staged_for_capacity_if_idle(req, pool="prefill_budget")
-                return admission
-
-            # A rejected candidate must not report prefillable or queue H2D.
-            if (self.prefill_delayer_single_pass is not None) and (
-                not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
-                    local_prefillable=True,
-                    running_batch=self.running_batch.batch_size(),
-                    max_prefill_bs=self.max_prefill_bs,
-                    max_running_requests=self.max_running_requests,
-                    waiting_queue_len=self.waiting_queue_len,
-                )
-            ):
-                return AddReqResult.OTHER
-
-            if req.needs_host_load_back():
-                load_max_new = min(max_new, admission.max_new_tokens)
-                # Reclaim can write back device victims and evict host leaves.
-                # Pin the selected host/aux match until load-back owns its locks.
-                with (
-                    self._lock_node(req.best_match_node, lock_host=True)
-                    if isinstance(self.tree_cache, UnifiedRadixCache)
-                    else nullcontext()
-                ):
-                    full_load_tokens = req.host_hit_length
+            total_tokens += mamba_gap_reserve
+            if self.rem_mamba_slots is not None:
+                required_mamba_slots = mamba_gap_reserve // self._mamba_slot_cost
+                if required_mamba_slots > self.rem_mamba_slots:
                     if (
-                        self.memory_budget.load_back_needs_full_tokens
-                        and isinstance(self.tree_cache, UnifiedRadixCache)
-                        and self.tree_cache.buffer_pipeline is None
-                        and not (
-                            self.tree_cache.linker is not None
-                            and self.tree_cache.linker.has_hit(req.rid)
+                        isinstance(self.tree_cache, UnifiedRadixCache)
+                        and self.tree_cache.buffer_pipeline is not None
+                    ):
+                        self.tree_cache.buffer_pipeline.defer_staged_admission(
+                            req, "mamba"
+                        )
+                    return AddReqResult.NO_TOKEN
+            request_slot_reserve = self._request_slot_reserve_for_req(req)
+            total_tokens += request_slot_reserve
+
+            retry_cold_after_pin_release = False
+            # The temporary pin excludes this prefix from the evictable budget.
+            # Selection itself neither allocates slots nor materializes host hits.
+            with self._lock_node(req.last_node):
+                self._rejected_for_bounded_replay_min_chunk = False
+                admission = self._select_prefill_admission(
+                    req,
+                    total_tokens=total_tokens,
+                    host_hit_length=req.host_hit_length,
+                    swa_host_hit_length=req.swa_host_hit_length,
+                    truncation_align_size=truncation_align_size,
+                    has_chunked_req=has_chunked_req,
+                )
+                if isinstance(admission, AddReqResult):
+                    if (
+                        attempt == 0
+                        and is_idle
+                        and admission is AddReqResult.NO_TOKEN
+                        and self._rejected_for_bounded_replay_min_chunk
+                        and (
+                            req.prefix_len > 0
+                            or req.host_hit_length > 0
+                            or req.swa_host_hit_length > 0
                         )
                     ):
-                        # Host hits can include resident FULL behind host-only aux.
-                        # Reuse the FULL transfer spec to count only new slots.
-                        full_transfer = (
-                            self.tree_cache.tree_core.build_hicache_transfers(
-                                ComponentType.FULL,
-                                req.best_match_node,
-                                CacheTransferPhase.LOAD_BACK,
-                            )[0]
-                        )
-                        full_load_tokens = len(full_transfer.host_indices)
-                    if not self.memory_budget.prepare_load_back(
-                        full_tokens=(
-                            full_load_tokens
-                            + admission.extend_len
-                            + load_max_new
-                            + self.page_size
-                            + mamba_gap_reserve
-                        ),
-                        extend_input_len=admission.extend_len,
-                        max_new_tokens=load_max_new,
-                        swa_host_hit_length=req.swa_host_hit_length,
-                        chunk_limit=self.rem_chunk_tokens,
-                    ):
-                        self._defer_staged_for_capacity_if_idle(
-                            req, pool="load_back_budget"
-                        )
-                        return AddReqResult.NO_TOKEN
-                    promised_host_hit = req.host_hit_length
-                    loaded = self.tree_cache.init_load_back(
-                        InitLoadBackParams(
-                            best_match_node=req.best_match_node,
-                            host_hit_length=req.host_hit_length,
-                            req=req,
-                        )
-                    )
-                if loaded is None:
-                    return AddReqResult.OTHER
-                req.host_loaded_length, req.last_node = loaded
-                if 0 < req.host_loaded_length < promised_host_hit:
-                    raise RuntimeError(
-                        "HiCache load-back must commit all promised FULL tokens or none: "
-                        f"req={req.rid} promised={promised_host_hit} "
-                        f"loaded={req.host_loaded_length}"
-                    )
-                if req.host_loaded_length > promised_host_hit:
-                    # A load can expose resident FULL behind host-only aux state; its
-                    # H2D is queued, so keep the approved budget and shrink the work.
-                    prefix_len = req.prefix_len + req.host_loaded_length
-                    extend_len = admission.extend_len
-                    if self.dllm_config is None:
-                        extend_len = min(
-                            extend_len, len(req.full_untruncated_fill_ids) - prefix_len
-                        )
-                    is_chunked = admission.is_chunked and (
-                        prefix_len + extend_len < len(req.full_untruncated_fill_ids)
-                    )
-                    max_new_tokens = admission.max_new_tokens
-                    if admission.is_chunked and not is_chunked:
-                        max_new_tokens = min(
-                            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
-                        )
-                    admission = _PrefillAdmission(
-                        prefix_len,
-                        extend_len,
-                        max_new_tokens,
-                        is_chunked,
-                        self._replay_len(req, prefix_len),
-                    )
-                elif req.host_loaded_length < promised_host_hit:
-                    # No FULL was loaded; recomputation may no longer fit.
-                    admission = self._select_prefill_admission(
-                        req,
-                        total_tokens=total_tokens,
-                        host_hit_length=0,
-                        swa_host_hit_length=0,
-                        truncation_align_size=truncation_align_size,
-                        has_chunked_req=has_chunked_req,
-                    )
-                    if isinstance(admission, AddReqResult):
+                        retry_cold_after_pin_release = True
+                    else:
+                        if admission is AddReqResult.NO_TOKEN:
+                            self._defer_staged_for_capacity_if_idle(
+                                req, pool="prefill_budget"
+                            )
                         return admission
-                req.prefix_len += req.host_loaded_length
-                if self.tree_cache.load_back_is_cache_owned():
-                    req.kv.cache_protected_len = req.prefix_len
 
-            # Sharded pools cannot load host KV; reserve scratch after all other gates.
-            if not self._kv_shard_reserve_scratch(
-                prefix_len=admission.prefix_len, extend_len=admission.extend_len
-            ):
-                return AddReqResult.OTHER
+                if not retry_cold_after_pin_release:
+                    # A rejected candidate must not report prefillable or queue H2D.
+                    if (self.prefill_delayer_single_pass is not None) and (
+                        not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                            local_prefillable=True,
+                            running_batch=self.running_batch.batch_size(),
+                            max_prefill_bs=self.max_prefill_bs,
+                            max_running_requests=self.max_running_requests,
+                            waiting_queue_len=self.waiting_queue_len,
+                        )
+                    ):
+                        return AddReqResult.OTHER
 
-            self._commit_prefill_admission(req, admission, mamba_gap_reserve)
+                    if req.needs_host_load_back():
+                        load_max_new = min(max_new, admission.max_new_tokens)
+                        # Reclaim can write back device victims and evict host leaves.
+                        # Pin the selected host/aux match until load-back owns its locks.
+                        with (
+                            self._lock_node(req.best_match_node, lock_host=True)
+                            if isinstance(self.tree_cache, UnifiedRadixCache)
+                            else nullcontext()
+                        ):
+                            full_load_tokens = req.host_hit_length
+                            if (
+                                self.memory_budget.load_back_needs_full_tokens
+                                and isinstance(self.tree_cache, UnifiedRadixCache)
+                                and self.tree_cache.buffer_pipeline is None
+                                and not (
+                                    self.tree_cache.linker is not None
+                                    and self.tree_cache.linker.has_hit(req.rid)
+                                )
+                            ):
+                                # Host hits can include resident FULL behind host-only aux.
+                                # Reuse the FULL transfer spec to count only new slots.
+                                full_transfer = (
+                                    self.tree_cache.tree_core.build_hicache_transfers(
+                                        ComponentType.FULL,
+                                        req.best_match_node,
+                                        CacheTransferPhase.LOAD_BACK,
+                                    )[0]
+                                )
+                                full_load_tokens = len(full_transfer.host_indices)
+                            if not self.memory_budget.prepare_load_back(
+                                full_tokens=(
+                                    full_load_tokens
+                                    + admission.extend_len
+                                    + load_max_new
+                                    + self.page_size
+                                    + mamba_gap_reserve
+                                ),
+                                extend_input_len=admission.extend_len,
+                                max_new_tokens=load_max_new,
+                                swa_host_hit_length=req.swa_host_hit_length,
+                                chunk_limit=self.rem_chunk_tokens,
+                            ):
+                                self._defer_staged_for_capacity_if_idle(
+                                    req, pool="load_back_budget"
+                                )
+                                return AddReqResult.NO_TOKEN
+                            promised_host_hit = req.host_hit_length
+                            loaded = self.tree_cache.init_load_back(
+                                InitLoadBackParams(
+                                    best_match_node=req.best_match_node,
+                                    host_hit_length=req.host_hit_length,
+                                    req=req,
+                                )
+                            )
+                        if loaded is None:
+                            return AddReqResult.OTHER
+                        req.host_loaded_length, req.last_node = loaded
+                        if 0 < req.host_loaded_length < promised_host_hit:
+                            raise RuntimeError(
+                                "HiCache load-back must commit all promised FULL tokens or none: "
+                                f"req={req.rid} promised={promised_host_hit} "
+                                f"loaded={req.host_loaded_length}"
+                            )
+                        if req.host_loaded_length > promised_host_hit:
+                            # A load can expose resident FULL behind host-only aux state; its
+                            # H2D is queued, so keep the approved budget and shrink the work.
+                            prefix_len = req.prefix_len + req.host_loaded_length
+                            extend_len = admission.extend_len
+                            if self.dllm_config is None:
+                                extend_len = min(
+                                    extend_len,
+                                    len(req.full_untruncated_fill_ids) - prefix_len,
+                                )
+                            is_chunked = admission.is_chunked and (
+                                prefix_len + extend_len
+                                < len(req.full_untruncated_fill_ids)
+                            )
+                            max_new_tokens = admission.max_new_tokens
+                            if admission.is_chunked and not is_chunked:
+                                max_new_tokens = min(
+                                    req.sampling_params.max_new_tokens,
+                                    CLIP_MAX_NEW_TOKENS,
+                                )
+                            admission = _PrefillAdmission(
+                                prefix_len,
+                                extend_len,
+                                max_new_tokens,
+                                is_chunked,
+                                self._replay_len(req, prefix_len),
+                            )
+                        elif req.host_loaded_length < promised_host_hit:
+                            # No FULL was loaded; recomputation may no longer fit.
+                            admission = self._select_prefill_admission(
+                                req,
+                                total_tokens=total_tokens,
+                                host_hit_length=0,
+                                swa_host_hit_length=0,
+                                truncation_align_size=truncation_align_size,
+                                has_chunked_req=has_chunked_req,
+                            )
+                            if isinstance(admission, AddReqResult):
+                                return admission
+                        req.prefix_len += req.host_loaded_length
+                        if self.tree_cache.load_back_is_cache_owned():
+                            req.kv.cache_protected_len = req.prefix_len
+
+                    # Sharded pools cannot load host KV; reserve scratch after all other gates.
+                    if not self._kv_shard_reserve_scratch(
+                        prefix_len=admission.prefix_len,
+                        extend_len=admission.extend_len,
+                    ):
+                        return AddReqResult.OTHER
+
+                    self._commit_prefill_admission(req, admission, mamba_gap_reserve)
+                    break
+
+            # Pin on the abandoned warm node is released; drop the hit and retry cold.
+            self._reset_req_to_cold_start(req)
 
         # This verdict controls the next candidate, not the committed request.
         return self.budget_state()
@@ -1599,6 +1615,58 @@ class PrefillAdder:
         if session is not None and session.will_lend_record(req):
             return 0
         return int(swa.sliding_window_size)
+
+    def _reset_req_to_cold_start(self, req: Req) -> None:
+        """Abandon a matched prefix so ``req`` starts cleanly from position 0,
+        releasing any staged hold and resetting deferred Mamba COW metadata."""
+        if (
+            isinstance(self.tree_cache, UnifiedRadixCache)
+            and self.tree_cache.buffer_pipeline is not None
+            and getattr(req, "cache_request_handle", None) is not None
+        ):
+            self.tree_cache.buffer_pipeline.release_staged_hold(
+                req.cache_request_handle,
+                reason="bounded_replay_cold_fallback",
+            )
+        root = self.tree_cache.root_node_handle()
+        req.prefix_len = 0
+        req.last_node = root
+        req.last_host_node = root
+        req.best_match_node = root
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
+        req.staged_prefetch_plan = None
+        req.kv.cache_protected_len = 0
+        if req.kv.mamba_cow_src_index is not None:
+            req.kv.mamba_cow_src_index = None
+            if req.kv.holds_mamba:
+                req.kv.mamba_needs_clear = True
+        req.mamba_branching_seqlen = None
+        req.swa_branching_seqlen = None
+
+    def _min_bounded_replay_continuation_chunk_tokens(self, req: Req) -> int:
+        """Minimum continuation chunk length under decoder SWA bounded replay
+        across all layouts (including FULL-only encoder replay, non-gating SWA,
+        and borrowed streaming sessions), because CUDA skip_mid_chunk_decoder
+        can skip late layers whenever remaining prompt tokens >= window."""
+        del req
+        if not getattr(self.tree_cache, "decoder_swa_bounded_replay", False):
+            return 0
+        components = getattr(self.tree_cache, "components", None)
+        swa = components.get(ComponentType.SWA) if components else None
+        if swa is not None and swa.sliding_window_size:
+            return int(swa.sliding_window_size)
+        alloc = getattr(self, "token_to_kv_pool_allocator", None)
+        kvcache = (
+            alloc.get_kvcache()
+            if alloc is not None and hasattr(alloc, "get_kvcache")
+            else None
+        )
+        window = getattr(kvcache, "sliding_window", None) or getattr(
+            self.tree_cache, "_sliding_window_size", None
+        )
+        return int(window) if window else 128
 
     def _has_undersized_bounded_replay_chunk(self, min_replay_chunk: int) -> bool:
         init_chunk = getattr(self, "init_chunk_tokens", None)
@@ -1663,10 +1731,7 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
-            ):
+            if has_chunked_req:
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:
@@ -1701,6 +1766,7 @@ class PrefillAdder:
                     # prefix (or a host-only SWA hit whose load-back exposes
                     # resident FULL prefix) makes late layers read below
                     # prefix_len into unverified late-layer SWA rows.
+                    self._rejected_for_bounded_replay_min_chunk = True
                     return (
                         AddReqResult.OTHER
                         if self.can_run_list

@@ -1314,11 +1314,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.release_swa_prefix_lock(req)
                 if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
                     # Reclaim private SWA past the active window using the actual
-                    # forward position (never truncated by an unconsumed
-                    # swa_branching_seqlen) and without prefix-sharing page
-                    # padding since this checkpoint does not insert into the tree.
-                    # FULL pages stay owned by req until async PD transfer drains.
-                    forward_len = max(0, len(token_ids) - int(self.tree_core.is_eagle))
+                    # forward token position (never truncated by an unconsumed
+                    # swa_branching_seqlen or EAGLE bigram subtraction) and
+                    # without prefix-sharing page padding since this checkpoint
+                    # does not insert into the tree. FULL pages stay owned by
+                    # req until async PD transfer drains.
+                    forward_len = len(token_ids)
                     free_swa_out_of_window_slots(
                         req,
                         forward_len,
@@ -1564,8 +1565,35 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             self.release_swa_prefix_lock(req)
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
-            for comp in self._components_tuple:
-                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+            if (
+                swa is not None
+                and swa.sliding_window_size
+                and getattr(self, "decoder_swa_bounded_replay", False)
+                and getattr(swa, "gates_prefix_match", True)
+            ):
+                free_swa_out_of_window_slots(
+                    req,
+                    len(token_ids),
+                    sliding_window_size=swa.sliding_window_size,
+                    page_size=self.page_size,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    supports_prefix_sharing=False,
+                )
+                insert_params.set_evicted_seqlen(
+                    ComponentType.SWA,
+                    req.kv.get_evicted_seqlen(ComponentType.SWA),
+                )
+                for comp in self._components_tuple:
+                    if comp.component_type != ComponentType.SWA:
+                        comp.free_out_of_window_slots(
+                            req, len(radix_key) - 1, insert_params
+                        )
+            else:
+                for comp in self._components_tuple:
+                    comp.free_out_of_window_slots(
+                        req, len(radix_key) - 1, insert_params
+                    )
 
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
