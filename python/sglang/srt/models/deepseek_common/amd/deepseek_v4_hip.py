@@ -183,7 +183,12 @@ def wq_b_unroped(attn, q) -> torch.Tensor:
     return q.view(-1, attn.n_local_heads, attn.head_dim)
 
 
-def _hcu_kv_pool_supports_fused_q_rope(attn) -> bool:
+def _hcu_kv_pool_supports_fused_q_rope(
+    attn,
+    *,
+    q_dtype: Optional[torch.dtype] = None,
+    kv_dtype: Optional[torch.dtype] = None,
+) -> bool:
     if not (
         _is_hcu
         and get_bool_env_var("SGLANG_HCU_FUSE_Q_ROPE", "true")
@@ -191,6 +196,17 @@ def _hcu_kv_pool_supports_fused_q_rope(attn) -> bool:
         and getattr(attn, "rope_head_dim", None) == 64
         and not in_replay_tail_graph()
     ):
+        return False
+    # FusedKNormRopeFlashMLAKernel::forward_with_q static_asserts bf16_t for K/Q.
+    if q_dtype is not None and q_dtype != torch.bfloat16:
+        return False
+    if kv_dtype is not None and kv_dtype != torch.bfloat16:
+        return False
+    kv_norm_weight = getattr(getattr(attn, "kv_norm", None), "weight", None)
+    if kv_norm_weight is not None and kv_norm_weight.dtype != torch.bfloat16:
+        return False
+    q_norm_weight = getattr(getattr(attn, "q_norm", None), "weight", None)
+    if q_norm_weight is not None and q_norm_weight.dtype != torch.bfloat16:
         return False
     pool = get_token_to_kv_pool()
     if pool is None:
@@ -210,15 +226,30 @@ def compute_q_b(
     q_out: Optional[torch.Tensor],
     unified: bool,
     use_cp: bool,
+    *,
+    kv_dtype: Optional[torch.dtype] = None,
 ):
     """attn._compute_q_b(q_for_wqb, positions, q_out) as (q, the q_lora the indexer reads,
     whether the K norm-rope-store launch ropes q). The indexer takes the fused operand:
     its wq_b would re-round onto the same grid."""
+    bf16_qk = q_lora.dtype == torch.bfloat16 and (
+        kv_dtype is None or kv_dtype == torch.bfloat16
+    )
     fuse_q_rope = (
-        _is_gfx95_supported or _hcu_kv_pool_supports_fused_q_rope(attn)
-    ) and fuses_q_rope_into_k_store(attn, q_out, unified=unified, use_cp=use_cp)
+        bf16_qk
+        and (
+            _is_gfx95_supported
+            or _hcu_kv_pool_supports_fused_q_rope(
+                attn, q_dtype=q_lora.dtype, kv_dtype=kv_dtype
+            )
+        )
+        and fuses_q_rope_into_k_store(attn, q_out, unified=unified, use_cp=use_cp)
+    )
     if fuse_q_rope:
         q = wq_b_unroped(attn, q_for_wqb)
+        if q.dtype != torch.bfloat16:
+            q = attn._compute_q_b(q_for_wqb, positions, q_out)
+            fuse_q_rope = False
     else:
         q = attn._compute_q_b(q_for_wqb, positions, q_out)
     indexer_q_lora = q_lora if _is_hcu else q_for_wqb

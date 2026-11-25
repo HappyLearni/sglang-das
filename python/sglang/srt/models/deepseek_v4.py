@@ -2467,6 +2467,7 @@ class MQALayer(MqaAttentionBase):
                     q_out,
                     unified,
                     use_cp or forward_batch.encoder_swa_replay,
+                    kv_dtype=qkv_a.dtype if qkv_a is not None else x_linear.dtype,
                 )
             elif not overlap_layer_split_prefetch:
                 q = self._compute_q_b(q_for_wqb, positions, q_out)
