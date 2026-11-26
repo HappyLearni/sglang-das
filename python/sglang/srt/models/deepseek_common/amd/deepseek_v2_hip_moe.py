@@ -7,9 +7,11 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.models.deepseek_common.utils import _use_aiter
+from sglang.srt.models.deepseek_common.utils import _is_hcu, _use_aiter
 
-if _use_aiter:
+_use_rocm_router = _use_aiter or _is_hcu
+
+if _use_rocm_router:
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_max_tokens
     from sglang.srt.layers.rocm_linear_utils import rocm_dsv3_router_split_k
 
@@ -18,7 +20,7 @@ def router_max_tokens(gate, config, is_hash_moe: bool) -> int:
     """Rows up to which the split-K router serves gate (a MoEGate), -1 when it never does:
     V4.1 only, DSv4 keeps aiter's router GEMM and gate."""
     if not (
-        _use_aiter
+        _use_rocm_router
         and gate.is_deepseek_v4
         and getattr(config, "model_type", None) == "deepseek_v41"
         and not is_hash_moe
@@ -44,12 +46,19 @@ def batch_has_images(forward_batch) -> bool:
 
 
 def forward_gate(
-    moe, hidden_states: torch.Tensor, gemm_output_zero_allocator, *, fused_gate: bool
+    moe,
+    hidden_states: torch.Tensor,
+    gemm_output_zero_allocator=None,
+    *,
+    fused_gate: bool,
+    forward_batch=None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """The router logits of moe (a DeepseekV2MoE) and, on the split-K decode router, the
     partials moe.topk sums into them; fused_gate=False when anything else reads them."""
-    if fused_gate and _use_aiter and not moe.is_hash:
+    if fused_gate and _use_rocm_router and not moe.is_hash:
         logits_and_partials = rocm_dsv3_router_split_k(moe.gate, hidden_states)
         if logits_and_partials is not None:
             return logits_and_partials
+    if forward_batch is not None:
+        return moe.gate(hidden_states, forward_batch=forward_batch), None
     return moe.gate(hidden_states, gemm_output_zero_allocator), None

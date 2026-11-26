@@ -252,6 +252,7 @@ if _use_aiter:
         from aiter.fused_moe import fused_topk as aiter_fused_topk
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+if _use_aiter or _is_hcu:
     from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_reduce_partials
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gate
 if _is_musa:
@@ -1924,24 +1925,43 @@ def biased_topk_jit_kernel_impl(
     sqrtsoftplus_log1p: bool = False,
     router_logits_partials: Optional[torch.Tensor] = None,
     num_shared_append: int = 0,
+    rocm_output_int64: bool = False,
+    rocm_mask_padded_rows: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """num_shared_append is only workable when router_logits_partials is not None
     and it is only used by rocm_router_gate"""
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert num_shared_append == 0 or router_logits_partials is not None
 
-    if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
+    if (
+        (_use_aiter or (_is_hcu and router_logits_partials is not None))
+        and scoring_func == "sqrtsoftplus"
+        and num_fused_shared_experts == 0
+    ):
         assert packed_out is None, "aiter topk_gating cannot emit packed ids"
         if router_logits_partials is not None:
-            # ROCm decode router: split-K reduce + gate in one launch
+            # ROCm decode router: split-K reduce + gate (+ optional DeepEP finalize) in one launch.
+            # Multiply routed_scaling_factor inside the gate only when the caller expects
+            # topk_weights to carry it (apply_routed_scaling_factor_on_output=True or aiter);
+            # otherwise (e.g. HCU DeepEP) leave weights unscaled so combine scales once.
+            gate_scale = (
+                routed_scaling_factor
+                if (_use_aiter or apply_routed_scaling_factor_on_output)
+                else 1.0
+            )
             return rocm_router_gate(
                 gating_output,
                 correction_bias,
                 topk,
                 renormalize,
-                routed_scaling_factor,
+                gate_scale,
                 partials=router_logits_partials,
                 num_shared=num_shared_append,
+                sqrtsoftplus_log1p=sqrtsoftplus_log1p,
+                num_token_non_padded=(
+                    num_token_non_padded if rocm_mask_padded_rows else None
+                ),
+                output_int64=rocm_output_int64,
             )
 
         from aiter import topk_gating
@@ -3344,19 +3364,37 @@ def select_experts(
     )
 
     if router_logits_partials is not None and not (
-        _use_aiter
+        (_use_aiter or _is_hcu)
         and scoring_func == "sqrtsoftplus"
         and custom_routing_function is None
         and not use_grouped_topk
         and not torch_native
         and expert_location_dispatch_info is None
         and (
+            _use_aiter
+            or not (
+                topk_config.sqrtsoftplus_log1p
+                and _can_use_lightop_deepep_topk_fusion(
+                    router_logits,
+                    top_k,
+                    num_fused_shared_experts,
+                    routing_overridden,
+                    expert_location_dispatch_info,
+                )
+            )
+        )
+        and (
             num_fused_shared_experts == 0
-            or has_per_rank_fused_shared_slots(num_fused_shared_experts)
-            or not is_expert_remapping_enabled()
+            or (
+                _use_aiter
+                and (
+                    has_per_rank_fused_shared_slots(num_fused_shared_experts)
+                    or not is_expert_remapping_enabled()
+                )
+            )
         )
     ):
-        # only the aiter sqrtsoftplus gate takes the partials; every other route reads router_logits
+        # only the ROCm sqrtsoftplus gate takes the partials; every other route reads router_logits
         rocm_router_reduce_partials(router_logits_partials, router_logits)
         router_logits_partials = None
 
@@ -3498,9 +3536,28 @@ def select_experts(
                     # the ROCm decode gate writes the aiter shared columns itself
                     _packed_kwargs["num_shared_append"] = num_fused_shared_experts
 
+            use_rocm_deepep_finalized_gate = (
+                _is_hcu
+                and router_logits_partials is not None
+                and not _use_aiter
+                and not _skip_hip_pad_mask
+                and get_moe_a2a_backend().is_deepep()
+                and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
+                and num_fused_shared_experts == 0
+                and top_k == 6
+                and router_logits.shape[1] == 384
+                and expert_location_dispatch_info is None
+                and not is_expert_remapping_enabled()
+                and not routing_overridden
+            )
+            if use_rocm_deepep_finalized_gate:
+                _packed_kwargs["rocm_output_int64"] = True
+                _packed_kwargs["rocm_mask_padded_rows"] = True
+
             use_lightop_gate = (
                 scoring_func == "sqrtsoftplus"
                 and "packed_out" not in _packed_kwargs
+                and router_logits_partials is None
                 and _can_use_lightop_sqrtsoftplus_gate(
                     router_logits,
                     correction_bias,
@@ -3553,8 +3610,10 @@ def select_experts(
                     apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                     **_packed_kwargs,
                 )
-                if (
-                    use_lightop_gate
+                if use_rocm_deepep_finalized_gate:
+                    deepep_ids_finalized = True
+                elif (
+                    (use_lightop_gate or (_is_hcu and router_logits_partials is not None))
                     and topk_config.sqrtsoftplus_log1p
                     and get_moe_a2a_backend().is_deepep()
                     and not _skip_hip_pad_mask
@@ -3564,6 +3623,7 @@ def select_experts(
                     _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
             padded_rows_masked = (
                 use_lightop_deepep_fusion
+                or use_rocm_deepep_finalized_gate
                 or _fused_gate_masks_padded_rows(scoring_func)
             )
         elif (

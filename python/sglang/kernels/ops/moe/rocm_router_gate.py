@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
 
@@ -34,16 +35,20 @@ def rocm_router_max_tokens(
     if num_experts != _GATE_NUM_EXPERTS or not 0 < topk <= _MAX_TOPK:
         return -1
     return rocm_gemv_split_k_max_tokens(
-        n=num_experts, k=hidden_size, weight_dtype=weight_dtype
+        n=num_experts, k=hidden_size, weight_dtype=weight_dtype, allow_hcu=True
     )
 
 
 @triton.jit
-def _score(x):
+def _score(x, SQRT_LOG1P: tl.constexpr):
     # aiter compute_score<SQRTSOFTPLUS>: +inf clamps to FLT_MAX, NaN passes, sqrt correctly rounded
     x = tl.where(x > _FLT_MAX, _FLT_MAX, x)
-    t = tl.exp2(x * _LOG2_E)
-    sp = tl.where(x > 20.0, x, tl.log2(1.0 + t) * _LN_2)
+    if SQRT_LOG1P:
+        safe_x = tl.where(x > 20.0, 0.0, x)
+        sp = tl.where(x > 20.0, x, libdevice.log1p(tl.exp(safe_x)))
+    else:
+        t = tl.exp2(x * _LOG2_E)
+        sp = tl.where(x > 20.0, x, tl.log2(1.0 + t) * _LN_2)
     return tl.sqrt_rn(sp)
 
 
@@ -100,6 +105,7 @@ def _gate_row(
     HAS_BIAS: tl.constexpr,
     RENORM: tl.constexpr,
     TOPK: tl.constexpr,
+    SQRT_LOG1P: tl.constexpr,
 ):
     """aiter's topk_gating_kernel_opt for one row on one 64-lane wave: returns the
     scaled weights and the ids as [64] lane tensors (lane k < TOPK holds slot k)."""
@@ -136,12 +142,12 @@ def _gate_row(
         tl.store(logits_ptr + row * stride_lm + i3, x3)
         tl.store(logits_ptr + row * stride_lm + i4, x4)
         tl.store(logits_ptr + row * stride_lm + i5, x5)
-    s0 = _score(x0)
-    s1 = _score(x1)
-    s2 = _score(x2)
-    s3 = _score(x3)
-    s4 = _score(x4)
-    s5 = _score(x5)
+    s0 = _score(x0, SQRT_LOG1P)
+    s1 = _score(x1, SQRT_LOG1P)
+    s2 = _score(x2, SQRT_LOG1P)
+    s3 = _score(x3, SQRT_LOG1P)
+    s4 = _score(x4, SQRT_LOG1P)
+    s5 = _score(x5, SQRT_LOG1P)
     # as in aiter, a NaN score weighs 0 and its choice value is -inf
     o0 = tl.where(s0 != s0, 0.0, s0)
     o1 = tl.where(s1 != s1, 0.0, s1)
@@ -218,7 +224,8 @@ def _router_gate_kernel(
     part_ptr,  # [SPLIT_K, M, 384] fp32 (SPLIT_K > 0)
     bias_ptr,  # [384] fp32 or bf16 (HAS_BIAS)
     weights_ptr,  # [M, TOPK] fp32
-    ids_ptr,  # [M, TOPK] int32
+    ids_ptr,  # [M, TOPK] int32 or int64
+    non_padded_ptr,  # [1] int32/int64 (HAS_NON_PADDED)
     stride_lm,
     stride_ps,
     stride_pm,
@@ -231,6 +238,9 @@ def _router_gate_kernel(
     RENORM: tl.constexpr,
     TOPK: tl.constexpr,
     NUM_SHARED: tl.constexpr,
+    SQRT_LOG1P: tl.constexpr,
+    HAS_NON_PADDED: tl.constexpr,
+    OUTPUT_INT64: tl.constexpr,
 ):
     row = tl.program_id(0)
     weights, ids = _gate_row(
@@ -247,6 +257,7 @@ def _router_gate_kernel(
         HAS_BIAS,
         RENORM,
         TOPK,
+        SQRT_LOG1P,
     )
     lane = tl.arange(0, 64)
     if NUM_SHARED > 0:
@@ -254,9 +265,16 @@ def _router_gate_kernel(
         is_shared = lane >= TOPK
         weights = tl.where(is_shared, 1.0, weights)
         ids = tl.where(is_shared, shared_id_base + lane - TOPK, ids)
+    if HAS_NON_PADDED:
+        is_pad = row >= tl.load(non_padded_ptr).to(tl.int32)
+        weights = tl.where(is_pad, 0.0, weights)
+        ids = tl.where(is_pad, -1, ids)
     out_mask = lane < TOPK + NUM_SHARED
     tl.store(weights_ptr + row * stride_om + lane, weights, mask=out_mask)
-    tl.store(ids_ptr + row * stride_om + lane, ids, mask=out_mask)
+    if OUTPUT_INT64:
+        tl.store(ids_ptr + row * stride_om + lane, ids.to(tl.int64), mask=out_mask)
+    else:
+        tl.store(ids_ptr + row * stride_om + lane, ids, mask=out_mask)
 
 
 def rocm_router_gate(
@@ -268,11 +286,15 @@ def rocm_router_gate(
     *,
     partials: Optional[torch.Tensor] = None,
     num_shared: int = 0,
+    sqrtsoftplus_log1p: bool = False,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    output_int64: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """aiter topk_gating(..., score_func="sqrtsoftplus") for 384 experts: fp32 weights and int32
-    ids [M, topk]; with partials their fixed-order sum is gated and written into
+    """aiter topk_gating(..., score_func="sqrtsoftplus") for 384 experts: fp32 weights and
+    int32/int64 ids [M, topk]; with partials their fixed-order sum is gated and written into
     gating_output. num_shared > 0 appends fused_append_shared_experts(..., scale_factor=1.0,
-    N=384) columns: ids and weights become [M, topk + num_shared]."""
+    N=384) columns: ids and weights become [M, topk + num_shared]. When num_token_non_padded
+    is supplied, padded rows (row >= num_token_non_padded) are masked to id=-1 and weight=0."""
     M, num_experts = gating_output.shape
     assert num_experts == _GATE_NUM_EXPERTS and 0 < topk <= _MAX_TOPK
     assert 0 <= num_shared <= _WARP - topk
@@ -294,7 +316,8 @@ def rocm_router_gate(
         )
     width = topk + num_shared
     weights = torch.empty((M, width), dtype=torch.float32, device=gating_output.device)
-    ids = torch.empty((M, width), dtype=torch.int32, device=gating_output.device)
+    ids_dtype = torch.int64 if output_int64 else torch.int32
+    ids = torch.empty((M, width), dtype=ids_dtype, device=gating_output.device)
     if M == 0:
         return weights, ids
     _router_gate_kernel[(M,)](
@@ -303,6 +326,7 @@ def rocm_router_gate(
         correction_bias if correction_bias is not None else gating_output,
         weights,
         ids,
+        num_token_non_padded if num_token_non_padded is not None else ids,
         gating_output.stride(0),
         stride_ps,
         stride_pm,
@@ -315,6 +339,9 @@ def rocm_router_gate(
         RENORM=bool(renormalize),
         TOPK=topk,
         NUM_SHARED=num_shared,
+        SQRT_LOG1P=bool(sqrtsoftplus_log1p),
+        HAS_NON_PADDED=num_token_non_padded is not None,
+        OUTPUT_INT64=bool(output_int64),
         num_warps=1,
     )
     return weights, ids
