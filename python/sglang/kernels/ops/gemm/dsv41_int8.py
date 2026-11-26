@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import weakref
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 
@@ -84,6 +85,69 @@ _lock = threading.RLock()
 _packs = {}
 _plans = {}
 _scale_seen = set()
+_algo_rank_cache: OrderedDict = OrderedDict()
+_failed_static_algo_keys: set = set()
+_ALGO_RANK_CACHE_MAX_ENTRIES = 4096
+_TRITON_SCALE_MIN_ELEMENTS = 4_194_304
+_device_arch_cache: dict = {}
+
+# Offline-benchmarked hipBLASLt heuristic algo_rank table for Hygon BW1000
+# (gfx936, DTK 26.04.1) on unpacked DeepSeek-V4.1 INT8 projections.
+# Key: (groups, rank, k, tile_n, group_major) -> (exact_m_map, bucket_m_map).
+# Uncovered shapes or non-gfx936 devices fall back directly to algo_rank=0
+# without online trial-and-error probing.
+_DEFAULT_GFX936_UNPACKED_ALGO_RANKS = {
+    # wo_a (target TP8/DP8): 2.2x-9.8x vs algo_rank=0
+    (8, 1024, 4096, 0, False): (
+        {
+            1: 27, 2: 26, 4: 26, 5: 26, 6: 27, 8: 27, 10: 24, 12: 24, 16: 24,
+            18: 13, 20: 29, 24: 17, 30: 17, 32: 18, 36: 18, 40: 18, 42: 18,
+            48: 20, 64: 20,
+        },
+        {128: 1, 256: 5, 512: 6, 1024: 4, 2048: 2, 4096: 1, 8192: 1},
+    ),
+    # wo_a (draft): 1.9x-24.7x vs algo_rank=0
+    (8, 512, 4096, 0, False): (
+        {
+            1: 4, 2: 4, 4: 3, 6: 4, 8: 4, 12: 2, 16: 3, 24: 31, 32: 11,
+            48: 31, 64: 30,
+        },
+        {128: 6, 256: 15, 512: 23, 1024: 17, 2048: 9, 4096: 8},
+    ),
+    # lm_head (full vocab, DP lm_head): 2.2x-7.0x vs algo_rank=0
+    (1, 129280, 5120, 0, False): (
+        {
+            1: 12, 2: 12, 4: 15, 5: 15, 6: 15, 8: 15, 10: 15, 12: 8, 16: 15,
+            18: 6, 20: 12, 24: 12, 30: 12, 32: 12, 36: 3, 40: 5, 42: 3,
+            48: 3, 64: 5,
+        },
+        {128: 14, 256: 2},
+    ),
+    # lm_head (TP8 sharded): 2.5x-8.0x vs algo_rank=0
+    (1, 16160, 5120, 0, False): (
+        {
+            1: 15, 2: 15, 4: 12, 5: 15, 6: 15, 8: 15, 12: 15, 16: 15,
+            24: 12, 32: 1, 48: 2, 64: 19,
+        },
+        {128: 3, 256: 3, 512: 6, 1024: 3, 2048: 3, 4096: 3},
+    ),
+    # DSPARK markov_head (TP8 sharded): 1.4x-3.0x vs algo_rank=0
+    (1, 16160, 256, 0, False): (
+        {
+            1: 16, 2: 8, 4: 11, 5: 15, 6: 4, 8: 10, 12: 20, 16: 15,
+            24: 11, 32: 15, 48: 11, 64: 3,
+        },
+        {128: 19, 256: 14},
+    ),
+    # DSPARK markov_head (full vocab): 1.5x-3.4x vs algo_rank=0
+    (1, 129280, 256, 0, False): (
+        {
+            1: 18, 2: 18, 4: 16, 5: 16, 6: 1, 8: 16, 12: 1, 16: 1,
+            24: 12, 32: 12, 48: 4, 64: 3,
+        },
+        {128: 4, 256: 19},
+    ),
+}
 
 _DEFAULT_SERVICE_CONFIG = {'algorithms': {'wo_a:1:4096:8:8192:1024:0': '9d220000000000000000000000000000',
                 'wo_a:5:4096:8:8192:1024:0': '9d220000000000000000000000000000',
@@ -221,6 +285,35 @@ def _scale_int32(ACC, XS, WS, Y, T:tl.constexpr, G:tl.constexpr,
 
 
 @triton.jit
+def _scale_int32_dynamic(
+    ACC,
+    XS,
+    WS,
+    Y,
+    T,
+    TOTAL,
+    G: tl.constexpr,
+    R: tl.constexpr,
+    GROUP_MAJOR: tl.constexpr,
+    B: tl.constexpr,
+):
+    j = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B).to(tl.int64)
+    valid = j < TOTAL
+    row = j // R
+    group = row % G
+    token = row // G
+    col = j % R
+    if GROUP_MAJOR:
+        raw = (group * T + token) * R + col
+    else:
+        raw = j
+    acc = tl.load(ACC + raw, valid, other=0).to(tl.float32)
+    xs = tl.load(XS + row, valid, other=0)
+    ws = tl.load(WS + group * R + col, valid, other=0)
+    tl.store(Y + j, acc * xs * ws, valid)
+
+
+@triton.jit
 def _scale_grid(ACC,XS,WS,Y,M:tl.constexpr,N:tl.constexpr,WIDTH:tl.constexpr,BLOCK:tl.constexpr):
  local=tl.program_id(0)*BLOCK+tl.arange(0,BLOCK);row=tl.program_id(1);group=tl.program_id(2);col=group*WIDTH+local;valid=local<WIDTH
  a=tl.load(ACC+(group*M+row)*WIDTH+local,valid,0).to(tl.float32);xs=tl.load(XS+row);ws=tl.load(WS+col,valid,0);tl.store(Y+row*N+col,(a*xs)*ws,valid)
@@ -243,6 +336,134 @@ def _algorithm_config(path):
         return json.load(f)["algorithms"]
 
 
+def _blaslt_static_algo_enabled() -> bool:
+    raw = os.environ.get("SGLANG_DSV41_INT8_BLASLT_STATIC_ALGO")
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return torch.version.hip is not None
+
+
+def _blaslt_autotune_enabled() -> bool:
+    # Online trial-and-error probing is opt-in (for offline tuning / explicit
+    # warmup) so serving requests never pay cold-search spikes or trigger
+    # failing Plan construction on older native wheels.
+    raw = os.environ.get("SGLANG_DSV41_INT8_BLASLT_AUTOTUNE")
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
+def _is_gfx936_device(device) -> bool:
+    if device is None or getattr(device, "type", None) != "cuda":
+        return False
+    idx = device.index
+    cached = _device_arch_cache.get(idx)
+    if cached is not None:
+        return cached
+    try:
+        arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+    except Exception:
+        arch = ""
+    is_match = arch == "gfx936"
+    _device_arch_cache[idx] = is_match
+    return is_match
+
+
+def _lookup_default_unpacked_algo_rank(
+    device, t: int, groups: int, rank: int, k: int, tile_n: int, group_major: bool
+):
+    if not _blaslt_static_algo_enabled() or not _is_gfx936_device(device):
+        return None
+    cache_key = (
+        getattr(device, "index", None),
+        _autotune_t_bucket(t),
+        groups,
+        rank,
+        k,
+        tile_n,
+        bool(group_major),
+    )
+    if cache_key in _failed_static_algo_keys:
+        return None
+    spec = _DEFAULT_GFX936_UNPACKED_ALGO_RANKS.get(
+        (groups, rank, k, tile_n, bool(group_major))
+    )
+    if spec is None:
+        return None
+    exact_map, bucket_map = spec
+    if t <= 64:
+        return exact_map.get(t)
+    t_bucket = _autotune_t_bucket(t)
+    return bucket_map.get(t_bucket)
+
+
+def _autotune_t_bucket(t: int) -> int:
+    # Keep exact M for small decode/graph-captured batches (<= 64) and bucket
+    # larger variable-length prefill chunks by next power of two so arbitrary
+    # chunk lengths reuse a handful of cached hipBLASLt heuristic ranks.
+    return t if t <= 64 else 1 << (t - 1).bit_length()
+
+
+def _select_unpacked_algo_rank(ops, q, w, raw, groups, rank, k, tile_n, group_major):
+    t = q.shape[1] if group_major else q.shape[0]
+    t_bucket = _autotune_t_bucket(t)
+    cache_key = (q.device.index, t_bucket, groups, rank, k, tile_n, bool(group_major))
+    cached = _algo_rank_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    if not q.is_cuda or torch.cuda.is_current_stream_capturing():
+        return 0
+    with _lock:
+        cached = _algo_rank_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if torch.cuda.is_current_stream_capturing():
+            return 0
+        max_ranks = max(
+            1, int(os.environ.get("SGLANG_DSV41_INT8_BLASLT_AUTOTUNE_MAX_RANKS", "32"))
+        )
+        best_rank = 0
+        best_ms = float("inf")
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        iters = 2
+        for cand in range(max_ranks):
+            try:
+                ops.gemm_out(q, w, raw, groups, tile_n, group_major, cand)
+            except RuntimeError:
+                if cand == 0:
+                    raise
+                break
+            if cand == 0:
+                ops.gemm_out(q, w, raw, groups, tile_n, group_major, cand)
+                start.record()
+                ops.gemm_out(q, w, raw, groups, tile_n, group_major, cand)
+                end.record()
+                end.synchronize()
+                probe_ms = start.elapsed_time(end)
+                if probe_ms < 0.3:
+                    iters = 10
+                elif probe_ms < 2.0:
+                    iters = 5
+                else:
+                    iters = 2
+            else:
+                ops.gemm_out(q, w, raw, groups, tile_n, group_major, cand)
+            start.record()
+            for _ in range(iters):
+                ops.gemm_out(q, w, raw, groups, tile_n, group_major, cand)
+            end.record()
+            end.synchronize()
+            elapsed = start.elapsed_time(end) / iters
+            if elapsed < best_ms:
+                best_ms = elapsed
+                best_rank = cand
+        _algo_rank_cache[cache_key] = best_rank
+        if len(_algo_rank_cache) > _ALGO_RANK_CACHE_MAX_ENTRIES:
+            _algo_rank_cache.popitem(last=False)
+        return best_rank
+
+
 def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, group_major=False, algo_rank=None):
     if (
         x.ndim != 3 or x.shape[1] != groups or groups <= 0 or rank <= 0
@@ -262,10 +483,25 @@ def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, 
         raise ValueError("INT8 BLASLt tile size must be non-negative")
     ops = load_native()
     t = x.shape[0]
+    k = x.shape[-1]
+    use_autotune = False
+    used_static = False
     if algo_rank is None:
         config = os.environ.get("SGLANG_DSV41_INT8_BLASLT_ALGO_CONFIG")
-        key = f"{t}:{groups}:{rank}:{x.shape[-1]}:{tile_n}:{int(group_major)}"
-        algo_rank = int(_algorithm_config(config).get(key, 0)) if config else 0
+        if config:
+            key = f"{t}:{groups}:{rank}:{k}:{tile_n}:{int(group_major)}"
+            algo_rank = int(_algorithm_config(config).get(key, 0))
+        elif _blaslt_autotune_enabled():
+            use_autotune = True
+        else:
+            static_rank = _lookup_default_unpacked_algo_rank(
+                x.device, t, groups, rank, k, tile_n, group_major
+            )
+            if static_rank is not None:
+                algo_rank = static_rank
+                used_static = True
+            else:
+                algo_rank = 0
     y = torch.empty((t, groups, rank), device=x.device, dtype=output_dtype)
     if not t:
         return y
@@ -274,8 +510,40 @@ def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, 
         q = q.transpose(0, 1).contiguous()
     raw = torch.empty((groups, t, rank) if group_major else (t, groups, rank),
                       device=x.device, dtype=torch.int32)
-    ops.gemm_out(q, w, raw, groups, tile_n, group_major, algo_rank)
-    ops.scale_out(raw, xs, s, y, groups, group_major)
+    if use_autotune:
+        algo_rank = _select_unpacked_algo_rank(
+            ops, q, w, raw, groups, rank, k, tile_n, group_major
+        )
+    try:
+        ops.gemm_out(q, w, raw, groups, tile_n, group_major, algo_rank)
+    except RuntimeError:
+        if (use_autotune or used_static) and algo_rank != 0:
+            fail_key = (
+                getattr(x.device, "index", None),
+                _autotune_t_bucket(t),
+                groups,
+                rank,
+                k,
+                tile_n,
+                bool(group_major),
+            )
+            with _lock:
+                if used_static:
+                    _failed_static_algo_keys.add(fail_key)
+                if use_autotune:
+                    _algo_rank_cache[fail_key] = 0
+            ops.gemm_out(q, w, raw, groups, tile_n, group_major, 0)
+        else:
+            raise
+    numel = t * groups * rank
+    if y.is_cuda and torch.version.hip is not None and numel >= _TRITON_SCALE_MIN_ELEMENTS:
+        sb = 2048
+        _scale_int32_dynamic[(triton.cdiv(numel, sb),)](
+            raw, xs, s, y, t, numel, groups, rank, bool(group_major), sb,
+            num_warps=8, enable_fp_fusion=False,
+        )
+    else:
+        ops.scale_out(raw, xs, s, y, groups, group_major)
     return y
 
 

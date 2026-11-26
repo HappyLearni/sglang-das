@@ -43,6 +43,37 @@ limitations under the License.
 #pragma clang fp reassociate(off)
 #endif
 
+namespace dsv41_lt {
+struct LtHandle {
+  hipblasLtHandle_t value = nullptr;
+  LtHandle() = default;
+  LtHandle(const LtHandle&) = delete;
+  LtHandle& operator=(const LtHandle&) = delete;
+  ~LtHandle() { if (value) hipblasLtDestroy(value); }
+};
+struct MatmulDesc {
+  hipblasLtMatmulDesc_t value = nullptr;
+  MatmulDesc() = default;
+  MatmulDesc(const MatmulDesc&) = delete;
+  MatmulDesc& operator=(const MatmulDesc&) = delete;
+  ~MatmulDesc() { if (value) hipblasLtMatmulDescDestroy(value); }
+};
+struct MatrixLayout {
+  hipblasLtMatrixLayout_t value = nullptr;
+  MatrixLayout() = default;
+  MatrixLayout(const MatrixLayout&) = delete;
+  MatrixLayout& operator=(const MatrixLayout&) = delete;
+  ~MatrixLayout() { if (value) hipblasLtMatrixLayoutDestroy(value); }
+};
+struct MatmulPreference {
+  hipblasLtMatmulPreference_t value = nullptr;
+  MatmulPreference() = default;
+  MatmulPreference(const MatmulPreference&) = delete;
+  MatmulPreference& operator=(const MatmulPreference&) = delete;
+  ~MatmulPreference() { if (value) hipblasLtMatmulPreferenceDestroy(value); }
+};
+}  // namespace dsv41_lt
+
 namespace dsv41_unpacked {
 // SPDX-License-Identifier: Apache-2.0
 // Only the three DSV4.1 channelwise INT8 projections use this bridge.
@@ -73,36 +104,36 @@ hipblasLtHandle_t handle_for(int device, hipStream_t stream) {
   return it->second->value;
 }
 struct Plan {
-  hipblasLtMatmulDesc_t desc = nullptr;
-  hipblasLtMatrixLayout_t a=nullptr,b=nullptr,c=nullptr,d=nullptr;
-  hipblasLtMatmulPreference_t pref = nullptr;
-  hipblasLtMatmulAlgo_t algo;
+  dsv41_lt::MatmulDesc desc;
+  dsv41_lt::MatrixLayout a, b, c, d;
+  hipblasLtMatmulAlgo_t algo{};
   Plan(hipblasLtHandle_t h, int64_t m,int64_t n,int64_t cols,int64_t k,
        int64_t g,bool group_major,int64_t algo_rank) {
-    check(hipblasLtMatmulDescCreate(&desc,HIPBLAS_COMPUTE_32I,HIP_R_32I),"descriptor");
+    check(hipblasLtMatmulDescCreate(&desc.value,HIPBLAS_COMPUTE_32I,HIP_R_32I),"descriptor");
     hipblasOperation_t ta=HIPBLAS_OP_T,tb=HIPBLAS_OP_N;
-    check(hipblasLtMatmulDescSetAttribute(desc,HIPBLASLT_MATMUL_DESC_TRANSA,&ta,sizeof(ta)),"transA");
-    check(hipblasLtMatmulDescSetAttribute(desc,HIPBLASLT_MATMUL_DESC_TRANSB,&tb,sizeof(tb)),"transB");
+    check(hipblasLtMatmulDescSetAttribute(desc.value,HIPBLASLT_MATMUL_DESC_TRANSA,&ta,sizeof(ta)),"transA");
+    check(hipblasLtMatmulDescSetAttribute(desc.value,HIPBLASLT_MATMUL_DESC_TRANSB,&tb,sizeof(tb)),"transB");
     const int64_t ldx=group_major?k:g*k, ldy=group_major?n:g*n;
-    check(hipblasLtMatrixLayoutCreate(&a,HIP_R_8I,k,cols,k),"A layout");
-    check(hipblasLtMatrixLayoutCreate(&b,HIP_R_8I,k,m,ldx),"B layout");
-    check(hipblasLtMatrixLayoutCreate(&c,HIP_R_32I,cols,m,ldy),"C layout");
-    check(hipblasLtMatrixLayoutCreate(&d,HIP_R_32I,cols,m,ldy),"D layout");
+    check(hipblasLtMatrixLayoutCreate(&a.value,HIP_R_8I,k,cols,k),"A layout");
+    check(hipblasLtMatrixLayoutCreate(&b.value,HIP_R_8I,k,m,ldx),"B layout");
+    check(hipblasLtMatrixLayoutCreate(&c.value,HIP_R_32I,cols,m,ldy),"C layout");
+    check(hipblasLtMatrixLayoutCreate(&d.value,HIP_R_32I,cols,m,ldy),"D layout");
     if(g>1) {
       int32_t count=static_cast<int32_t>(g);
       int64_t strides[4]={n*k,group_major?m*k:k,group_major?m*n:n,group_major?m*n:n};
-      hipblasLtMatrixLayout_t layouts[4]={a,b,c,d};
+      hipblasLtMatrixLayout_t layouts[4]={a.value,b.value,c.value,d.value};
       for(int i=0;i<4;i++) {
         check(hipblasLtMatrixLayoutSetAttribute(layouts[i],HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,&count,sizeof(count)),"batch count");
         check(hipblasLtMatrixLayoutSetAttribute(layouts[i],HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,&strides[i],sizeof(int64_t)),"batch stride");
       }
     }
-    check(hipblasLtMatmulPreferenceCreate(&pref),"preference");
+    dsv41_lt::MatmulPreference pref;
+    check(hipblasLtMatmulPreferenceCreate(&pref.value),"preference");
     uint64_t workspace=0;
-    check(hipblasLtMatmulPreferenceSetAttribute(pref,HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&workspace,sizeof(workspace)),"workspace");
+    check(hipblasLtMatmulPreferenceSetAttribute(pref.value,HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&workspace,sizeof(workspace)),"workspace");
     hipblasLtMatmulHeuristicResult_t results[64]{};
     int count=0;
-    const auto status=hipblasLtMatmulAlgoGetHeuristic(h,desc,a,b,c,d,pref,64,results,&count);
+    const auto status=hipblasLtMatmulAlgoGetHeuristic(h,desc.value,a.value,b.value,c.value,d.value,pref.value,64,results,&count);
     TORCH_CHECK(status==HIPBLAS_STATUS_SUCCESS && count>algo_rank && results[algo_rank].state==HIPBLAS_STATUS_SUCCESS && results[algo_rank].workspaceSize==0,
       "No zero-workspace hipBLASLt INT8->INT32 algorithm: M=",m,", N=",cols,", K=",k,", G=",g,
       ", group_major=",group_major,", status=",static_cast<int>(status),", count=",count,
@@ -111,11 +142,6 @@ struct Plan {
     const char* log=std::getenv("SGLANG_DSV41_INT8_BLASLT_LOG");
     if(log && log[0]=='1') std::cerr<<"[DSV41_BLASLT_INT8] M="<<m<<" N="<<cols<<" K="<<k<<" G="<<g
       <<" group_major="<<group_major<<" algo_rank="<<algo_rank<<" A/B=INT8 C/D=INT32 compute=INT32 workspace=0\n";
-  }
-  ~Plan() {
-    if(a)hipblasLtMatrixLayoutDestroy(a);if(b)hipblasLtMatrixLayoutDestroy(b);
-    if(c)hipblasLtMatrixLayoutDestroy(c);if(d)hipblasLtMatrixLayoutDestroy(d);
-    if(pref)hipblasLtMatmulPreferenceDestroy(pref);if(desc)hipblasLtMatmulDescDestroy(desc);
   }
 };
 Plan& plan_for(int device,hipblasLtHandle_t h,hipStream_t stream,int64_t m,int64_t n,
@@ -153,8 +179,8 @@ void gemm_out(const at::Tensor& q,const at::Tensor& w,at::Tensor out,
   for(int64_t start=0;start<n;start+=step) {
     const auto cols=std::min(step,n-start);
     auto& p=plan_for(q.get_device(),h,stream,m,n,cols,k,groups,group_major,algo_rank);
-    check(hipblasLtMatmul(h,p.desc,&alpha,wp+start*k,p.a,xp,p.b,&beta,yp+start,p.c,
-                         yp+start,p.d,&p.algo,nullptr,0,stream),"matmul");
+    check(hipblasLtMatmul(h,p.desc.value,&alpha,wp+start*k,p.a.value,xp,p.b.value,&beta,yp+start,p.c.value,
+                         yp+start,p.d.value,&p.algo,nullptr,0,stream),"matmul");
   }
 }
 }
@@ -414,24 +440,23 @@ namespace {
 void ck(hipblasStatus_t s,const char*n){TORCH_CHECK(s==HIPBLAS_STATUS_SUCCESS,"optimized BLASLt ",n," status ",int(s));}
 struct Plan {
  int64_t m,g,n,k,batches,lda,astride,pitch;bool shard;int device;
- hipblasLtHandle_t h=nullptr;hipblasLtMatmulDesc_t desc=nullptr;hipblasLtMatrixLayout_t a=nullptr,b=nullptr,c=nullptr,d=nullptr;hipblasLtMatmulAlgo_t algo{};int32_t alpha=1,beta=0;std::mutex mutex;
+ dsv41_lt::LtHandle h;dsv41_lt::MatmulDesc desc;dsv41_lt::MatrixLayout a,b,c,d;hipblasLtMatmulAlgo_t algo{};int32_t alpha=1,beta=0;std::mutex mutex;
  Plan(const at::Tensor&w,int64_t mm,int64_t gg,int64_t nn,int64_t kk,int64_t bb,int64_t ld,int64_t st,int64_t pp,bool sh,const std::string& hex):m(mm),g(gg),n(nn),k(kk),batches(bb),lda(ld),astride(st),pitch(pp),shard(sh),device(w.get_device()){
   TORCH_CHECK(w.is_cuda()&&w.scalar_type()==at::kChar&&w.is_contiguous(),"packed INT8 required");
   TORCH_CHECK(m>0&&g>0&&n>0&&k>0&&batches>0&&(g==1||batches==g)&&g*n%batches==0&&pitch>=k&&pitch%4==0&&lda>=g*n/batches&&astride>0&&(!shard||g==1),"invalid geometry");
   int64_t width=g*n/batches;TORCH_CHECK(w.numel()>=(batches-1)*astride+(k-1)*lda+width,"packed weight span");
   c10::DeviceGuard guard(w.device());auto stream=c10::hip::getCurrentHIPStream(device).stream();hipStreamCaptureStatus capture;TORCH_CHECK(hipStreamIsCapturing(stream,&capture)==hipSuccess&&capture==hipStreamCaptureStatusNone,"warm up each shape before graph capture");
-  ck(hipblasLtCreate(&h),"create");ck(hipblasLtMatmulDescCreate(&desc,HIPBLAS_COMPUTE_32I,HIP_R_32I),"desc");
-  ck(hipblasLtMatrixLayoutCreate(&a,HIP_R_8I,width,k,lda),"A");ck(hipblasLtMatrixLayoutCreate(&b,HIP_R_8I,k,m,g*pitch),"B");
-  ck(hipblasLtMatrixLayoutCreate(&c,HIP_R_32I,width,m,shard?width:g*n),"C");ck(hipblasLtMatrixLayoutCreate(&d,HIP_R_32I,width,m,shard?width:g*n),"D");
-  if(batches>1){int32_t count=batches;int64_t strides[4]={astride,g>1?pitch:0,shard?m*width:width,shard?m*width:width};hipblasLtMatrixLayout_t ls[4]={a,b,c,d};for(int i=0;i<4;i++){ck(hipblasLtMatrixLayoutSetAttribute(ls[i],HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,&count,sizeof(count)),"batch");ck(hipblasLtMatrixLayoutSetAttribute(ls[i],HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,&strides[i],sizeof(int64_t)),"stride");}}
+  ck(hipblasLtCreate(&h.value),"create");ck(hipblasLtMatmulDescCreate(&desc.value,HIPBLAS_COMPUTE_32I,HIP_R_32I),"desc");
+  ck(hipblasLtMatrixLayoutCreate(&a.value,HIP_R_8I,width,k,lda),"A");ck(hipblasLtMatrixLayoutCreate(&b.value,HIP_R_8I,k,m,g*pitch),"B");
+  ck(hipblasLtMatrixLayoutCreate(&c.value,HIP_R_32I,width,m,shard?width:g*n),"C");ck(hipblasLtMatrixLayoutCreate(&d.value,HIP_R_32I,width,m,shard?width:g*n),"D");
+  if(batches>1){int32_t count=batches;int64_t strides[4]={astride,g>1?pitch:0,shard?m*width:width,shard?m*width:width};hipblasLtMatrixLayout_t ls[4]={a.value,b.value,c.value,d.value};for(int i=0;i<4;i++){ck(hipblasLtMatrixLayoutSetAttribute(ls[i],HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,&count,sizeof(count)),"batch");ck(hipblasLtMatrixLayoutSetAttribute(ls[i],HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,&strides[i],sizeof(int64_t)),"stride");}}
   if(!hex.empty()){
    TORCH_CHECK(hex.size()==32,"algorithm hex length");unsigned char bytes[16];for(int i=0;i<16;i++)bytes[i]=std::stoul(hex.substr(i*2,2),nullptr,16);std::memcpy(algo.data,bytes,16);
-   hipblasLtMatmulHeuristicResult_t result{};ck(hipblasLtMatmulAlgoCheck(h,desc,a,b,c,d,&algo,&result),"selected algorithm check");TORCH_CHECK(result.workspaceSize==0,"selected algorithm workspace");
+   hipblasLtMatmulHeuristicResult_t result{};ck(hipblasLtMatmulAlgoCheck(h.value,desc.value,a.value,b.value,c.value,d.value,&algo,&result),"selected algorithm check");TORCH_CHECK(result.workspaceSize==0,"selected algorithm workspace");
   }else{
-   hipblasLtMatmulPreference_t pref;ck(hipblasLtMatmulPreferenceCreate(&pref),"preference");uint64_t zero=0;ck(hipblasLtMatmulPreferenceSetAttribute(pref,HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&zero,sizeof(zero)),"workspace preference");hipblasLtMatmulHeuristicResult_t results[32]{};int count=0;auto status=hipblasLtMatmulAlgoGetHeuristic(h,desc,a,b,c,d,pref,32,results,&count);hipblasLtMatmulPreferenceDestroy(pref);ck(status,"heuristic");bool found=false;for(int i=0;i<count;i++)if(results[i].state==HIPBLAS_STATUS_SUCCESS&&results[i].workspaceSize==0){algo=results[i].algo;found=true;break;}TORCH_CHECK(found,"no zero-workspace INT8 algorithm");
+   dsv41_lt::MatmulPreference pref;ck(hipblasLtMatmulPreferenceCreate(&pref.value),"preference");uint64_t zero=0;ck(hipblasLtMatmulPreferenceSetAttribute(pref.value,HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&zero,sizeof(zero)),"workspace preference");hipblasLtMatmulHeuristicResult_t results[32]{};int count=0;ck(hipblasLtMatmulAlgoGetHeuristic(h.value,desc.value,a.value,b.value,c.value,d.value,pref.value,32,results,&count),"heuristic");bool found=false;for(int i=0;i<count;i++)if(results[i].state==HIPBLAS_STATUS_SUCCESS&&results[i].workspaceSize==0){algo=results[i].algo;found=true;break;}TORCH_CHECK(found,"no zero-workspace INT8 algorithm");
   }
  }
- ~Plan(){if(a)hipblasLtMatrixLayoutDestroy(a);if(b)hipblasLtMatrixLayoutDestroy(b);if(c)hipblasLtMatrixLayoutDestroy(c);if(d)hipblasLtMatrixLayoutDestroy(d);if(desc)hipblasLtMatmulDescDestroy(desc);if(h)hipblasLtDestroy(h);}
 };
 std::mutex registry_mutex;std::vector<std::shared_ptr<Plan>> plans;
 std::shared_ptr<Plan> get(int64_t id){std::lock_guard<std::mutex> lock(registry_mutex);TORCH_CHECK(id>0&&id<=int64_t(plans.size())&&plans[id-1],"invalid plan");return plans[id-1];}
@@ -442,7 +467,7 @@ void gemm(const at::Tensor&q,const at::Tensor&w,at::Tensor raw,int64_t id){
  TORCH_CHECK(q.scalar_type()==at::kChar&&w.scalar_type()==at::kChar&&raw.scalar_type()==at::kInt&&w.is_contiguous()&&raw.is_contiguous(),"GEMM types/layout");
  TORCH_CHECK(q.dim()==3&&q.size(0)==p->m&&q.size(1)==p->g&&q.size(2)==p->k&&q.stride(2)==1&&q.stride(1)==p->pitch&&q.stride(0)==p->g*p->pitch&&raw.numel()==p->m*p->g*p->n,"GEMM geometry mismatch");
  TORCH_CHECK(w.numel()>=(p->batches-1)*p->astride+(p->k-1)*p->lda+p->g*p->n/p->batches,"weight span mismatch");
- auto stream=c10::hip::getCurrentHIPStream(p->device).stream();ck(hipblasLtMatmul(p->h,p->desc,&p->alpha,w.data_ptr(),p->a,q.data_ptr(),p->b,&p->beta,raw.data_ptr(),p->c,raw.data_ptr(),p->d,&p->algo,nullptr,0,stream),"INT8/INT32 matmul");
+ auto stream=c10::hip::getCurrentHIPStream(p->device).stream();ck(hipblasLtMatmul(p->h.value,p->desc.value,&p->alpha,w.data_ptr(),p->a.value,q.data_ptr(),p->b.value,&p->beta,raw.data_ptr(),p->c.value,raw.data_ptr(),p->d.value,&p->algo,nullptr,0,stream),"INT8/INT32 matmul");
 }
 void scale(const at::Tensor&raw,const at::Tensor&xs,const at::Tensor&ws,at::Tensor out,int64_t groups,int64_t batches,bool shard,int64_t mode){
  TORCH_CHECK(raw.is_cuda()&&xs.device()==raw.device()&&ws.device()==raw.device()&&out.device()==raw.device(),"scale device mismatch");c10::DeviceGuard guard(raw.device());
