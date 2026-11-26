@@ -415,6 +415,7 @@ class MoriKVManager(CommonKVManager):
             self._abort_ack_lock = threading.Lock()
             self._source_drain = SourceDrainTracker()
             self._deferred_wire_failures: Dict[int, str] = {}
+            self._wire_failure_local = threading.local()
             self._drain_queue: Queue[
                 Optional[Tuple[TransferKVChunk, List[TransferStatus]]]
             ] = Queue(maxsize=self._num_shards)
@@ -590,6 +591,40 @@ class MoriKVManager(CommonKVManager):
         deferred.setdefault(room, failure_reason)
         self.record_failure(room, failure_reason)
         self.update_status(room, KVPoll.Failed)
+
+    def conclude_transfer(
+        self,
+        bootstrap_room: int,
+        status: KVPoll,
+        *,
+        targets=None,
+        failure_reason: Optional[str] = None,
+    ) -> Optional[KVPoll]:
+        if not self.enable_deferred_decode_kv_release and not getattr(
+            getattr(self, "_wire_failure_local", None), "allow_wire_failure", False
+        ):
+            if bootstrap_room not in self.request_status:
+                return None
+            with self.failure_lock:
+                recorded = self.failure_records.get(bootstrap_room)
+            if (
+                status == KVPoll.Failed
+                or recorded is not None
+                or self.request_status.get(bootstrap_room) == KVPoll.Failed
+            ):
+                self._publish_or_defer_failure(
+                    bootstrap_room,
+                    recorded
+                    or failure_reason
+                    or "Room marked Failed before the transfer ended",
+                )
+                return KVPoll.Failed
+        return super().conclude_transfer(
+            bootstrap_room=bootstrap_room,
+            status=status,
+            targets=targets,
+            failure_reason=failure_reason,
+        )
 
     def _handle_submission_failure(
         self, kv_chunk: TransferKVChunk, exc: _MoriTransferSubmissionError
@@ -2168,9 +2203,16 @@ class MoriKVSender(CommonKVSender):
             deferred.pop(self.bootstrap_room, None) if deferred is not None else None
         )
         if reason is not None:
-            self.kv_mgr.conclude_failure(
-                bootstrap_room=self.bootstrap_room, failure_reason=reason
-            )
+            wire_local = getattr(self.kv_mgr, "_wire_failure_local", None)
+            if wire_local is None:
+                wire_local = self.kv_mgr._wire_failure_local = threading.local()
+            wire_local.allow_wire_failure = True
+            try:
+                self.kv_mgr.conclude_failure(
+                    bootstrap_room=self.bootstrap_room, failure_reason=reason
+                )
+            finally:
+                wire_local.allow_wire_failure = False
         if self.is_transfer_drained():
             self.clear()
 

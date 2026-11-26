@@ -5057,18 +5057,16 @@ class Scheduler(
             return None, running_batch
 
         # If any TP/CP rank failed mid-cleanup while another freed its row/KV,
-        # pause new prefill admission on every rank until the retry completes so
-        # local free-row/KV counts cannot split the next collective batch.
-        if self.chunked_req is None and (
-            any(
-                getattr(r, "pd_abort_resource_cleanup_pending", False)
-                for r in getattr(self, "disagg_prefill_inflight_queue", ())
-            )
-            or any(
-                getattr(r, "pd_abort_resource_cleanup_pending", False)
-                for r in getattr(self, "_external_kv_chunked_abort_reqs", {}).values()
-            )
-        ):
+        # pause new waiting-queue admission on every rank until the retry
+        # completes so local free-row/KV counts cannot split the next batch.
+        abort_cleanup_pending = any(
+            getattr(r, "pd_abort_resource_cleanup_pending", False)
+            for r in getattr(self, "disagg_prefill_inflight_queue", ())
+        ) or any(
+            getattr(r, "pd_abort_resource_cleanup_pending", False)
+            for r in getattr(self, "_external_kv_chunked_abort_reqs", {}).values()
+        )
+        if abort_cleanup_pending and self.chunked_req is None:
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -5234,7 +5232,7 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in () if abort_cleanup_pending else self.waiting_queue:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if adder.budget_state() == AddReqResult.OTHER:

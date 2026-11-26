@@ -2541,6 +2541,8 @@ class SchedulerDisaggregationPrefillMixin:
                             )
                             if callable(notify_fn):
                                 notify_fn()
+                            elif callable(getattr(req.disagg_kv_sender, "clear", None)):
+                                req.disagg_kv_sender.clear()
                         self.clear_pending_chunk_send(req)
                         maybe_release_metadata_buffer(
                             req,
@@ -2550,7 +2552,17 @@ class SchedulerDisaggregationPrefillMixin:
                         if not req.external_kv_linker_released:
                             self._release_aborted_request(req)
                             req.external_kv_linker_released = True
-                        if req.kv.holds_kv or req.kv.holds_mamba:
+                        if (
+                            req.kv.holds_kv
+                            or req.kv.holds_mamba
+                            or any(
+                                name.startswith("kv.")
+                                for name in getattr(
+                                    req, "external_kv_cleanup_steps", {}
+                                )
+                            )
+                        ):
+                            req.external_kv_abort_requested = True
                             release_kv_cache(req, self.tree_cache, checkpoint=False)
                         req.external_kv_cache_released = True
                     except Exception:
@@ -2606,6 +2618,8 @@ class SchedulerDisaggregationPrefillMixin:
                             )
                             if callable(notify_fn):
                                 notify_fn()
+                            elif callable(getattr(req.disagg_kv_sender, "clear", None)):
+                                req.disagg_kv_sender.clear()
                         self.clear_pending_chunk_send(req)
                         if req.to_finish is not None and not req.finished():
                             req.update_finish_state()
@@ -2621,7 +2635,17 @@ class SchedulerDisaggregationPrefillMixin:
                                 req.cache_request_handle, CacheRequestOutcome.ABORT
                             )
                             req.external_kv_linker_released = True
-                        if req.kv.holds_kv or req.kv.holds_mamba:
+                        if (
+                            req.kv.holds_kv
+                            or req.kv.holds_mamba
+                            or any(
+                                name.startswith("kv.")
+                                for name in getattr(
+                                    req, "external_kv_cleanup_steps", {}
+                                )
+                            )
+                        ):
+                            req.external_kv_abort_requested = True
                             release_kv_cache(req, self.tree_cache, checkpoint=False)
                         req.external_kv_cache_released = True
                     except Exception:
@@ -2632,6 +2656,20 @@ class SchedulerDisaggregationPrefillMixin:
                         local_resource_cleaned[idx] = 0
                         undone_reqs.append(req)
                         continue
+                if not req.external_kv_response_sent and not getattr(
+                    req, "external_kv_abort_response_via_chunked", False
+                ):
+                    try:
+                        req.time_stats.set_completion_time()
+                        self.output_streamer.stream_output([req], req.return_logprob)
+                    except Exception:
+                        logger.exception(
+                            "Aborted prefill result response failed for %s; will retry",
+                            req.rid,
+                        )
+                        undone_reqs.append(req)
+                        continue
+                    req.external_kv_response_sent = True
                 req.external_kv_cleanup_done = True
                 req.pd_result_abort_pending = False
                 done_reqs.append(req)
@@ -2731,6 +2769,11 @@ class SchedulerDisaggregationPrefillMixin:
                         undone_reqs.append(req)
                 elif (
                     poll == KVPoll.Bootstrapping
+                    and all(local_resource_cleaned)
+                    and not any(
+                        getattr(r, "pd_abort_resource_cleanup_pending", False)
+                        for r in self.disagg_prefill_inflight_queue
+                    )
                     and get_disagg().disaggregation_decode_allocation_policy
                     != "prefill_complete"
                     and self.req_to_token_pool.available_size() == 0

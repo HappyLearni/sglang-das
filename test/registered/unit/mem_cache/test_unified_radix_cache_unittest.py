@@ -15956,6 +15956,108 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
             Scheduler._get_new_batch_prefill_raw(m_sched, None, m_rb)
         mix_batch.mix_with_running.assert_called_once_with(m_rb)
 
+        # 9) Round 8: MoRI conclude_transfer(Success) on aborted room defers
+        # wire Failed until notify_failure_after_all_ranks_drained, and
+        # pd_result_abort_pending engages journaled KV release, clears non-MoRI
+        # sender state, and retries output_streamer BEFORE retiring.
+        import threading
+
+        from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
+        from sglang.srt.disaggregation.mori.conn import MoriKVManager, MoriKVSender
+
+        mmgr = MoriKVManager.__new__(MoriKVManager)
+        mmgr.enable_deferred_decode_kv_release = False
+        mmgr.request_status = {77: KVPoll.Failed}
+        mmgr.failure_lock = threading.Lock()
+        mmgr.failure_records = {}
+        mmgr._deferred_wire_failures = {}
+        mmgr._wire_failure_local = threading.local()
+        mmgr._source_drain = SourceDrainTracker()
+        mmgr.record_failure = lambda room, reason: mmgr.failure_records.setdefault(
+            room, reason
+        )
+        mmgr.update_status = lambda room, st: mmgr.request_status.__setitem__(room, st)
+        wire_sent = []
+        with mock.patch(
+            "sglang.srt.disaggregation.common.conn.CommonKVManager.conclude_transfer",
+            side_effect=lambda *a, **kw: wire_sent.append(kw.get("status")),
+        ):
+            res_poll = mmgr.conclude_transfer(bootstrap_room=77, status=KVPoll.Success)
+            self.assertEqual(res_poll, KVPoll.Failed)
+            self.assertEqual(wire_sent, [])
+            self.assertIn(77, mmgr._deferred_wire_failures)
+            msender = MoriKVSender.__new__(MoriKVSender)
+            msender.kv_mgr = mmgr
+            msender.bootstrap_room = 77
+            msender.clear = Mock()
+            msender.notify_failure_after_all_ranks_drained()
+            self.assertEqual(wire_sent, [KVPoll.Failed])
+            msender.clear.assert_called_once()
+
+        r_req = Req(
+            rid="result-abort-ipc-retry",
+            origin_input_text="",
+            origin_input_ids=array("q", [1, 2, 3, 4]),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        r_req.kv.req_pool_idx = 0
+        r_req.metadata_buffer_index = 2
+        r_req.finished_reason = FINISH_ABORT("cancelled")
+        r_req.pd_result_abort_pending = True
+        r_sender = SimpleNamespace(
+            poll=lambda: KVPoll.Failed,
+            is_transfer_drained=lambda: True,
+            abort=Mock(),
+            clear=Mock(),
+        )
+        r_req.disagg_kv_sender = r_sender
+        r_streamed = []
+        r_fail = {"fail": True}
+
+        def _flaky_result_stream(reqs, _lp):
+            if r_fail["fail"]:
+                r_fail["fail"] = False
+                raise RuntimeError("detokenizer busy")
+            r_streamed.extend(r.rid for r in reqs)
+
+        r_sched = Scheduler.__new__(Scheduler)
+        r_sched.disaggregation_mode = DisaggregationMode.PREFILL
+        r_sched.disagg_prefill_inflight_queue = [r_req]
+        r_sched.disagg_prefill_pending_chunk_rids = {"result-abort-ipc-retry"}
+        r_sched._external_kv_abort_rids = set()
+        r_sched.scheduler_stage_metrics = None
+        r_sched.attn_tp_cpu_group = None
+        r_sched.attn_cp_cpu_group = None
+        r_sched.req_to_metadata_buffer_idx_allocator = Mock()
+        r_sched.disagg_metadata_buffers = SimpleNamespace(pd_hidden_pool=None)
+        r_sched.tree_cache = Mock()
+        r_sched.output_streamer = SimpleNamespace(stream_output=_flaky_result_stream)
+        with (
+            mock.patch(
+                "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+                return_value=[int(KVPoll.Failed)],
+            ),
+            mock.patch(
+                "sglang.srt.disaggregation.prefill.release_kv_cache"
+            ) as mock_r_rel,
+        ):
+            SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+                r_sched
+            )
+            self.assertTrue(r_req.external_kv_abort_requested)
+            self.assertEqual(mock_r_rel.call_count, 1)
+            r_sender.clear.assert_called_once()
+            self.assertEqual(r_streamed, [])
+            self.assertEqual(r_sched.disagg_prefill_inflight_queue, [r_req])
+            self.assertFalse(r_req.external_kv_cleanup_done)
+            SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+                r_sched
+            )
+            self.assertEqual(mock_r_rel.call_count, 1)
+            self.assertEqual(r_streamed, ["result-abort-ipc-retry"])
+            self.assertEqual(r_sched.disagg_prefill_inflight_queue, [])
+            self.assertTrue(r_req.external_kv_cleanup_done)
+
 
 if __name__ == "__main__":
     unittest.main()
