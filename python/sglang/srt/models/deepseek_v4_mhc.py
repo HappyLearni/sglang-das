@@ -51,6 +51,13 @@ _is_hcu = is_hcu()
 _use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
 _hc_mix_stats_opt = envs.SGLANG_HCU_HC_MIX_STATS_OPT.get()
 _use_hcu_hc_mix_stats = _is_hcu and _use_lightop and _hc_mix_stats_opt
+_use_hcu_hc_mix_stats_triton = _is_hcu and get_bool_env_var(
+    "SGLANG_HCU_HC_MIX_STATS_TRITON", default="true"
+)
+# Empirical BW1000 crossover vs both lightop.hc_mix_stats+hc_split_sinkhorn and
+# hc_mix_stats_sinkhorn_deepgemm/bf16x3: M=768/1024 are faster or break-even on
+# LightOp, while M>=1536 delivers 1.63x-4.30x speedup with Triton MFMA BF16x3.
+_HCU_HC_MIX_STATS_TRITON_MIN_TOKENS = 1536
 _use_aiter_tilelang_mhc = get_bool_env_var(
     "SGLANG_ROCM_USE_AITER_TILELANG_MHC", default="false"
 )
@@ -357,6 +364,29 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
                 cfg.eps,
             )
         return pre, post, comb
+    if (
+        _use_hcu_hc_mix_stats_triton
+        and _HCU_HC_MIX_STATS_TRITON_MIN_TOKENS <= x_flat.shape[0] <= 65536
+        and x_flat.dtype == torch.bfloat16
+        and x_flat.is_contiguous()
+        and not is_batch_invariant_mode_enabled()
+        and hc.bf16_parts is not None
+    ):
+        from sglang.kernels.ops.layernorm.mhc_hcu_triton import (
+            can_use_hc_mix_stats_sinkhorn_bf16x3_hcu,
+            hc_mix_stats_sinkhorn_bf16x3_hcu,
+        )
+
+        if can_use_hc_mix_stats_sinkhorn_bf16x3_hcu(x_flat, hc.bf16_parts, cfg.mult):
+            return hc_mix_stats_sinkhorn_bf16x3_hcu(
+                x_flat,
+                hc.bf16_parts,
+                hc.scale,
+                hc.base,
+                cfg.sinkhorn_iters,
+                cfg.rms_eps,
+                cfg.eps,
+            )
     if (
         _use_hcu_hc_mix_stats
         and x_flat.dtype == torch.bfloat16
