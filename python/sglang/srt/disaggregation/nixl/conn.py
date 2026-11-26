@@ -1713,10 +1713,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # per-req loop and `continue` the worker main loop without
                 # touching room status -- the next pop will retry.
                 staging_deferred = False
+                completed_peers = getattr(kv_chunk, "_completed_peers", None)
+                peers_posted_this_pass: List[str] = []
 
                 for req in reqs_to_be_processed:
                     assert room == req.room
                     if req.is_dummy:
+                        continue
+                    if (
+                        completed_peers is not None
+                        and req.agent_name in completed_peers
+                    ):
                         continue
 
                     assert req.agent_name in self.decode_kv_args_table
@@ -1924,11 +1931,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         )
                         handles.append(aux_xfer_handle)
 
+                    peers_posted_this_pass.append(req.agent_name)
+
                 if staging_deferred:
                     # Settle any handles already posted for earlier peers in
                     # this chunk before yielding to the re-enqueued retry so an
                     # abort cannot mark the chunk drained while an earlier
-                    # peer's RDMA transfer is still active.
+                    # peer's RDMA transfer is still active, and record those
+                    # peers as completed so the retry never overwrites a
+                    # recycled decode staging slot.
                     if handles:
                         settled, any_failed = self._await_handles(
                             handles, failure_seen=False
@@ -1946,6 +1957,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 f"NIXL transfer encountered ERR on earlier "
                                 f"peer room={room}"
                             )
+                    if state_notifs and self.request_status.get(room) not in (
+                        None,
+                        KVPoll.Failed,
+                    ):
+                        for peer_name, notif in state_notifs:
+                            self.agent.send_notif(peer_name, notif.encode("ascii"))
+                    if peers_posted_this_pass:
+                        if completed_peers is None:
+                            completed_peers = set()
+                            kv_chunk._completed_peers = completed_peers
+                        completed_peers.update(peers_posted_this_pass)
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 

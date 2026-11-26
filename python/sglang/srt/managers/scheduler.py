@@ -4569,15 +4569,32 @@ class Scheduler(
                 )
                 for idx, aborted_req in enumerate(pending_reqs)
             ]
+            local_res_ok = [
+                int(
+                    not agreed_drained[idx]
+                    or getattr(aborted_req, "external_kv_cache_released", False)
+                )
+                for idx, aborted_req in enumerate(pending_reqs)
+            ]
             all_done = (
                 all_reduce_fn(local_done) if all_reduce_fn is not None else local_done
             )
+            all_res_ok = (
+                all_reduce_fn(local_res_ok)
+                if all_reduce_fn is not None
+                else local_res_ok
+            )
             for idx, aborted_req in enumerate(pending_reqs):
                 if all_done[idx]:
+                    aborted_req.pd_abort_resource_cleanup_pending = False
                     pending.pop(aborted_req.rid, None)
                     if self._pending_chunked_abort_req is aborted_req:
                         self._pending_chunked_abort_req = None
                     logger.debug(f"Abort chunked prefill request. {aborted_req.rid=}")
+                else:
+                    aborted_req.pd_abort_resource_cleanup_pending = not bool(
+                        all_res_ok[idx]
+                    )
         req = self._pending_chunked_abort_req
         if req is None or req.external_kv_abort_requested or req.rid in pending:
             return
@@ -5039,6 +5056,21 @@ class Scheduler(
         ) and self.chunked_req is None:
             return None, running_batch
 
+        # If any TP/CP rank failed mid-cleanup while another freed its row/KV,
+        # pause new prefill admission on every rank until the retry completes so
+        # local free-row/KV counts cannot split the next collective batch.
+        if self.chunked_req is None and (
+            any(
+                getattr(r, "pd_abort_resource_cleanup_pending", False)
+                for r in getattr(self, "disagg_prefill_inflight_queue", ())
+            )
+            or any(
+                getattr(r, "pd_abort_resource_cleanup_pending", False)
+                for r in getattr(self, "_external_kv_chunked_abort_reqs", {}).values()
+            )
+        ):
+            return None, running_batch
+
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
@@ -5410,9 +5442,22 @@ class Scheduler(
             # Beam member rows are not supported inside a mixed extend batch.
             and all(r.beam_group is None for r in running_batch.reqs)
             # Do not promote a non-FULL prefill batch to FULL via a FULL decode
-            # batch under paged-SWA bounded replay (outside DSpark), nor mix if
-            # running_bs was withheld from the prefill chunk budget above.
-            and not non_mixing_full_decode
+            # batch under paged-SWA bounded replay (outside DSpark), nor exceed
+            # chunked_prefill_size when running_bs was withheld from the prefill
+            # chunk budget above. If a non-FULL head was deferred after look-ahead
+            # and a FULL prefill behind it fits with the FULL decode rows, allow
+            # valid FULL+FULL mixing.
+            and not (
+                non_mixing_full_decode
+                and (
+                    new_batch.return_hidden_states_mode != CaptureHiddenMode.FULL
+                    or (
+                        chunked_prefill_size is not None
+                        and new_batch.extend_num_tokens + len(running_batch.reqs)
+                        > chunked_prefill_size
+                    )
+                )
+            )
             and not (
                 getattr(self.tree_cache, "isolates_full_hidden_state_batches", None)
                 is not None

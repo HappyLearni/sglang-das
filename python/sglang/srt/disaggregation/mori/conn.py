@@ -414,6 +414,7 @@ class MoriKVManager(CommonKVManager):
             self._transfer_timeout_ms = envs.SGLANG_MORI_TRANSFER_TIMEOUT_MS.get()
             self._abort_ack_lock = threading.Lock()
             self._source_drain = SourceDrainTracker()
+            self._deferred_wire_failures: Dict[int, str] = {}
             self._drain_queue: Queue[
                 Optional[Tuple[TransferKVChunk, List[TransferStatus]]]
             ] = Queue(maxsize=self._num_shards)
@@ -558,9 +559,7 @@ class MoriKVManager(CommonKVManager):
                 except Exception:
                     pass
                 try:
-                    self.conclude_failure(
-                        bootstrap_room=kv_chunk.room, failure_reason=failure_reason
-                    )
+                    self._publish_or_defer_failure(kv_chunk.room, failure_reason)
                 except Exception:
                     try:
                         logger.exception(
@@ -575,6 +574,23 @@ class MoriKVManager(CommonKVManager):
             if is_quiescent:
                 self._mark_transfer_quiescent(kv_chunk)
 
+    def _publish_or_defer_failure(self, room: int, failure_reason: str) -> None:
+        if self.enable_deferred_decode_kv_release:
+            # Decode holds destination KV until the deferred abort ACK fires
+            # after all writers drain, so conclude on the wire immediately.
+            self.conclude_failure(bootstrap_room=room, failure_reason=failure_reason)
+            return
+        # Without deferred decode KV release, decode frees every TP rank's
+        # destination KV as soon as Failed arrives on the wire. Only mark local
+        # status Failed here so later chunks skip and the prefill TP/CP
+        # scheduler aborts & drains every peer rank before notifying decode.
+        deferred = getattr(self, "_deferred_wire_failures", None)
+        if deferred is None:
+            deferred = self._deferred_wire_failures = {}
+        deferred.setdefault(room, failure_reason)
+        self.record_failure(room, failure_reason)
+        self.update_status(room, KVPoll.Failed)
+
     def _handle_submission_failure(
         self, kv_chunk: TransferKVChunk, exc: _MoriTransferSubmissionError
     ) -> None:
@@ -583,9 +599,7 @@ class MoriKVManager(CommonKVManager):
             self._enqueue_transfer_drain(kv_chunk, exc.statuses, failure_reason)
             return
         self._mark_transfer_quiescent(kv_chunk)
-        self.conclude_failure(
-            bootstrap_room=kv_chunk.room, failure_reason=failure_reason
-        )
+        self._publish_or_defer_failure(kv_chunk.room, failure_reason)
 
     def _mark_transfer_started(self, kv_chunk: TransferKVChunk) -> None:
         if not self.enable_deferred_decode_kv_release:
@@ -646,7 +660,7 @@ class MoriKVManager(CommonKVManager):
         if self._should_skip_transfer(room):
             return True
         if failure_reason is not None:
-            self.conclude_failure(bootstrap_room=room, failure_reason=failure_reason)
+            self._publish_or_defer_failure(room, failure_reason)
             return True
 
         if kv_chunk.is_last_chunk:
@@ -697,20 +711,7 @@ class MoriKVManager(CommonKVManager):
         failure_reason: Optional[str],
     ) -> None:
         if failure_reason is not None:
-            if self.enable_deferred_decode_kv_release:
-                # Decode holds destination KV until the deferred abort ACK fires
-                # after drain, so conclude immediately to fail fast.
-                self.conclude_failure(
-                    bootstrap_room=kv_chunk.room, failure_reason=failure_reason
-                )
-            else:
-                # Without deferred decode release, decode frees destination KV as
-                # soon as Failed is published on the wire. Only mark local status
-                # Failed now so later chunks skip, and defer wire publication
-                # until all in-progress writes settle in the drainer.
-                self.record_failure(kv_chunk.room, failure_reason)
-                self.update_status(kv_chunk.room, KVPoll.Failed)
-                kv_chunk._deferred_failure_reason = failure_reason
+            self._publish_or_defer_failure(kv_chunk.room, failure_reason)
         drain_queue = getattr(self, "_drain_queue", None)
         if drain_queue is not None:
             drain_queue.put((kv_chunk, statuses))
@@ -741,12 +742,6 @@ class MoriKVManager(CommonKVManager):
         for status in statuses:
             if status.InProgress():
                 status.Wait()
-        deferred_reason = getattr(kv_chunk, "_deferred_failure_reason", None)
-        if deferred_reason is not None:
-            kv_chunk._deferred_failure_reason = None
-            self.conclude_failure(
-                bootstrap_room=kv_chunk.room, failure_reason=deferred_reason
-            )
         self._mark_transfer_quiescent(kv_chunk)
 
     def _should_skip_transfer(self, room: int) -> bool:
@@ -2165,11 +2160,28 @@ class MoriKVSender(CommonKVSender):
             return drain.drained(self.bootstrap_room)
         return True
 
+    def notify_failure_after_all_ranks_drained(self) -> None:
+        """Publish any deferred wire Failed notification once every prefill
+        TP/CP rank has physically drained all RDMA writes, then clear room."""
+        deferred = getattr(self.kv_mgr, "_deferred_wire_failures", None)
+        reason = (
+            deferred.pop(self.bootstrap_room, None) if deferred is not None else None
+        )
+        if reason is not None:
+            self.kv_mgr.conclude_failure(
+                bootstrap_room=self.bootstrap_room, failure_reason=reason
+            )
+        if self.is_transfer_drained():
+            self.clear()
+
     def failure_exception(self):
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
-        self.clear()
+        deferred = getattr(self.kv_mgr, "_deferred_wire_failures", None)
+        has_deferred_wire = deferred is not None and self.bootstrap_room in deferred
+        if self.is_transfer_drained() and not has_deferred_wire:
+            self.clear()
 
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)

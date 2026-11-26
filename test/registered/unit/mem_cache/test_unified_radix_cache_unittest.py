@@ -15090,8 +15090,10 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
                     cn["n"] += 1
                     if cn["n"] == 1:
                         return list(reduced_d)
-                    votes[r_i] = list(flags)
-                    return [0] * len(flags)
+                    if cn["n"] == 2:
+                        votes[r_i] = list(flags)
+                        return [0] * len(flags)
+                    return list(flags)
 
                 s._all_reduce_drain_flags = _hook
                 with mock.patch(
@@ -15189,8 +15191,10 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
                 cn["n"] += 1
                 if cn["n"] == 1:
                     return [1]
-                bs_done_votes[idx] = list(flags)
-                return [0]  # rank 0 failed IPC, rank 1 succeeded -> MIN = 0
+                if cn["n"] == 2:
+                    bs_done_votes[idx] = list(flags)
+                    return [0]  # rank 0 failed IPC, rank 1 succeeded -> MIN = 0
+                return [1]  # both ranks released KV/row cleanly
 
             bs._all_reduce_drain_flags = _bs_reduce
             with (
@@ -15284,10 +15288,17 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
 
         nixl_mgr._await_handles = _fake_await
 
+        staging_calls = []
+        peer_b_defer = {"defer": True}
+
         def _fake_staging(_strat, _chunk, _src, peer_req, _dst, _q):
+            staging_calls.append(peer_req.agent_name)
             if peer_req.agent_name == "peerA":
                 return "peerA-handle", False
-            return None, True
+            if peer_b_defer["defer"]:
+                peer_b_defer["defer"] = False
+                return None, True
+            return "peerB-handle", False
 
         nixl_mgr._do_staging_transfer = _fake_staging
         n_chunk = TransferKVChunk(
@@ -15299,13 +15310,19 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
             state_indices=None,
         )
         q_mock = Mock()
-        q_mock.get.side_effect = [n_chunk, StopIteration()]
+        q_mock.get.side_effect = [n_chunk, n_chunk, StopIteration()]
         with self.assertRaises(StopIteration):
             nixl_mgr.transfer_worker(q_mock, staging_buffer=object())
-        self.assertEqual(awaited_batches, [(["peerA-handle"], False)])
+        # Dequeue 1 posts peerA and defers on peerB (settling peerA-handle).
+        # Dequeue 2 skips already-completed peerA and posts ONLY peerB!
+        self.assertEqual(staging_calls, ["peerA", "peerB", "peerB"])
+        self.assertEqual(
+            awaited_batches, [(["peerA-handle"], False), (["peerB-handle"], False)]
+        )
 
-        # 5) MoRI defers wire conclude_failure until status.Wait() settles when
-        # enable_deferred_decode_kv_release=False.
+        # 5) MoRI defers wire conclude_failure until ALL prefill TP/CP ranks
+        # drain when enable_deferred_decode_kv_release=False, and
+        # failure_exception() does not clear the room before notification.
         try:
             importlib.import_module("mori.cpp")
             importlib.import_module("mori.io")
@@ -15339,12 +15356,15 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
             sys.modules["mori.cpp"] = mori_cpp
             sys.modules["mori.io"] = mori_io
 
+        from sglang.srt.disaggregation.common.conn import KVTransferError
         from sglang.srt.disaggregation.mori.conn import MoriKVManager, MoriKVSender
 
         m2 = MoriKVManager.__new__(MoriKVManager)
         m2.disaggregation_mode = DisaggregationMode.PREFILL
         m2.enable_deferred_decode_kv_release = False
+        m2.deferred_bootstrap = None
         m2.request_status = {91: KVPoll.Transferring}
+        m2.req_to_decode_prefix_len = {}
         m2.transfer_infos = {91: object()}
         m2.failure_lock = threading.Lock()
         m2.failure_records = {}
@@ -15352,6 +15372,8 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         m2._transfer_queues = [Queue()]
         m2._drain_queue = Queue(maxsize=2)
         m2._source_drain = SourceDrainTracker()
+        m2._deferred_wire_failures = {}
+        m2._maybe_ack_drained_abort = lambda _r: None
         m2.conclude_failure = Mock()
         m2_sender = MoriKVSender.__new__(MoriKVSender)
         m2_sender.kv_mgr = m2
@@ -15366,15 +15388,29 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         m2_status.Wait.side_effect = lambda: m2_events.append("wait")
         m2.conclude_failure.side_effect = lambda **_kw: m2_events.append("conclude")
         m2._enqueue_transfer_drain(m2_chunk, [m2_status], "SLA exceeded")
-        # Before drainer finishes, wire conclude_failure has NOT fired yet, but
-        # local status is Failed (later chunks skip) and source stays undrained.
+        # Before drainer finishes, wire conclude_failure has NOT fired yet,
+        # local status is Failed, and failure_exception() preserves room state.
         m2.conclude_failure.assert_not_called()
         self.assertEqual(m2.request_status[91], KVPoll.Failed)
         self.assertFalse(m2_sender.is_transfer_drained())
+        with self.assertRaises(KVTransferError):
+            m2_sender.failure_exception()
+        self.assertIn(91, m2.request_status)
+        self.assertIn(91, m2.transfer_infos)
         d_chunk, d_statuses = m2._drain_queue.get_nowait()
         m2._drain_transfer_statuses(d_chunk, d_statuses)
-        self.assertEqual(m2_events, ["wait", "conclude"])
+        # Local drain alone still withholds wire Failed until all TP/CP ranks drain.
+        self.assertEqual(m2_events, ["wait"])
         self.assertTrue(m2_sender.is_transfer_drained())
+        m2.conclude_failure.assert_not_called()
+        # Once collective all_drained == 1, wire conclude_failure fires & clears room.
+        m2_sender.notify_failure_after_all_ranks_drained()
+        self.assertEqual(m2_events, ["wait", "conclude"])
+        m2.conclude_failure.assert_called_once_with(
+            bootstrap_room=91, failure_reason="SLA exceeded"
+        )
+        self.assertNotIn(91, m2.request_status)
+        self.assertNotIn(91, m2.transfer_infos)
 
         # 6) Two-page paged SWA pool (page=256, window=128, size_swa=512)
         # completes a 1024-token cold request with max_new_tokens=0 without
@@ -15605,6 +15641,320 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         # Ready FULL behind pending non-FULL head keeps mixing enabled (2 decode rows).
         self.assertEqual(mixed_decode_seen, [2])
         self.assertEqual(poll_log, ["non-full-pending-l3", "full-ready-behind"])
+
+    def test_round7_capacity_pause_ipc_retry_shared_swa_and_post_poll_mix(self):
+        """Regression tests for Round-7 findings:
+        3. Resource-cleanup failure on one rank pauses new prefill admission on
+           all ranks via pd_abort_resource_cleanup_pending.
+        5A. OutputStreamer rolls back finished_output when IPC send raises so a
+            retry actually emits the response.
+        5B. Client chunked abort IPC retry is not bypassed by retirement guard.
+        6. SharedSWAPrefillBudget.available_chunk_tokens accepts prefix_len.
+        8. Non-FULL head deferred after L3 poll still allows FULL+FULL mixing
+           when the admitted FULL prefill fits with FULL decode."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.prefill import (
+            SchedulerDisaggregationPrefillMixin,
+        )
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.layers.logits_processor import CaptureHiddenMode
+        from sglang.srt.managers.schedule_policy import AddReqResult
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.output_streamer import (
+            SchedulerOutputStreamer,
+        )
+        from sglang.srt.mem_cache.prefill_budget import SharedSWAPrefillBudget
+
+        # 3) Resource cleanup pending pauses new prefill admission symmetrically.
+        blocked_req = Req(
+            rid="res-cleanup-pending",
+            origin_input_text="",
+            origin_input_ids=array("q", [1, 2, 3, 4]),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        blocked_req.pd_abort_resource_cleanup_pending = True
+        waiting_req = Req(
+            rid="waiting-next",
+            origin_input_text="",
+            origin_input_ids=array("q", [5, 6, 7, 8]),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        p_sched = Scheduler.__new__(Scheduler)
+        p_sched.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        p_sched.enable_hierarchical_cache = False
+        p_sched.enable_unified_cache_external_linker = False
+        p_sched.enable_waiting_queue_dfs_prefetch = False
+        p_sched.enable_priority_preemption = False
+        p_sched.is_hybrid_swa = False
+        p_sched.waiting_queue = [waiting_req]
+        p_sched.chunked_req = None
+        p_sched.disagg_prefill_inflight_queue = [blocked_req]
+        p_sched._external_kv_chunked_abort_reqs = {}
+        empty_rb = SimpleNamespace(reqs=[], batch_is_full=False, is_empty=lambda: True)
+        with mock.patch(
+            "sglang.srt.managers.scheduler.get_memory",
+            return_value=SimpleNamespace(enable_flexkv=False),
+        ):
+            nb, _ = Scheduler._get_new_batch_prefill_raw(p_sched, None, empty_rb)
+        self.assertIsNone(nb)
+
+        # 5A) OutputStreamer rolls back finished_output on IPC send error.
+        sent_payloads = []
+        fail_once = {"fail": True}
+
+        def _flaky_send(payload):
+            if fail_once["fail"]:
+                fail_once["fail"] = False
+                raise RuntimeError("detokenizer IPC busy")
+            sent_payloads.append(payload)
+
+        streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=SimpleNamespace(send_output=_flaky_send),
+            tree_cache=SimpleNamespace(),
+            server_args=SimpleNamespace(enable_lmcache=False),
+            is_generation=True,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            enable_hicache_storage=lambda: False,
+            rust_server=None,
+        )
+        s_req = Req(
+            rid="streamer-retry",
+            origin_input_text="",
+            origin_input_ids=array("q", [1, 2, 3, 4]),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        s_req.finished_reason = FINISH_LENGTH(length=0)
+        self.assertFalse(s_req.finished_output)
+        with (
+            mock.patch(
+                "sglang.srt.managers.scheduler_components.output_streamer.get_serving",
+                return_value=SimpleNamespace(stream_interval=1, weight_version=0),
+            ),
+            mock.patch(
+                "sglang.srt.managers.scheduler_components.output_streamer.get_parallel",
+                return_value=SimpleNamespace(dp_rank=0, attn_tp_rank=1),
+            ),
+        ):
+            with self.assertRaises(RuntimeError):
+                streamer._stream_output_generation([s_req], return_logprob=False)
+            self.assertFalse(s_req.finished_output)
+            self.assertEqual(sent_payloads, [])
+            streamer._stream_output_generation([s_req], return_logprob=False)
+            self.assertTrue(s_req.finished_output)
+            self.assertEqual(len(sent_payloads), 1)
+
+        # 5B) Client chunked abort IPC failure retries send_output without
+        # bypassing via retirement guard or double-releasing KV/metadata.
+        c_req = Req(
+            rid="client-ipc-retry",
+            origin_input_text="",
+            origin_input_ids=array("q", [1, 2, 3, 4]),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        c_req.kv.req_pool_idx = 0
+        c_req.metadata_buffer_index = 3
+        c_req.pd_client_chunked_abort_pending = True
+        c_req.pd_client_chunked_abort_msg = SimpleNamespace(rid="client-ipc-retry")
+        c_req.disagg_kv_sender = SimpleNamespace(
+            poll=lambda: KVPoll.Failed,
+            is_transfer_drained=lambda: True,
+            abort=Mock(),
+        )
+        tok_sends = []
+        tok_fail = {"fail": True}
+
+        def _flaky_tok(msg, req):
+            if tok_fail["fail"]:
+                tok_fail["fail"] = False
+                raise RuntimeError("tokenizer IPC down")
+            tok_sends.append(msg.rid)
+
+        c_sched = Scheduler.__new__(Scheduler)
+        c_sched.disaggregation_mode = DisaggregationMode.PREFILL
+        c_sched.disagg_prefill_inflight_queue = [c_req]
+        c_sched.disagg_prefill_pending_chunk_rids = {"client-ipc-retry"}
+        c_sched._external_kv_abort_rids = set()
+        c_sched.scheduler_stage_metrics = None
+        c_sched.attn_tp_cpu_group = None
+        c_sched.attn_cp_cpu_group = None
+        c_sched.req_to_metadata_buffer_idx_allocator = Mock()
+        c_sched.disagg_metadata_buffers = SimpleNamespace(pd_hidden_pool=None)
+        c_sched.tree_cache = Mock()
+        c_sched._release_aborted_request = Mock()
+        c_sched.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=_flaky_tok)
+        )
+        with (
+            mock.patch(
+                "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+                return_value=[int(KVPoll.Failed)],
+            ),
+            mock.patch(
+                "sglang.srt.disaggregation.prefill.release_kv_cache"
+            ) as mock_rel_kv,
+        ):
+            # Tick 1: KV/metadata released, tokenizer IPC raises -> retained.
+            SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+                c_sched
+            )
+            self.assertEqual(mock_rel_kv.call_count, 1)
+            self.assertEqual(tok_sends, [])
+            self.assertEqual(c_sched.disagg_prefill_inflight_queue, [c_req])
+            self.assertFalse(c_req.external_kv_cleanup_done)
+            # Tick 2: retries tokenizer IPC without repeating KV release & pops.
+            SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+                c_sched
+            )
+            self.assertEqual(mock_rel_kv.call_count, 1)
+            self.assertEqual(tok_sends, ["client-ipc-retry"])
+            self.assertEqual(c_sched.disagg_prefill_inflight_queue, [])
+            self.assertTrue(c_req.external_kv_cleanup_done)
+
+        # 6) SharedSWAPrefillBudget.available_chunk_tokens accepts prefix_len.
+        shared_budget = SharedSWAPrefillBudget.__new__(SharedSWAPrefillBudget)
+        self.assertEqual(shared_budget.available_chunk_tokens(512, prefix_len=256), 512)
+        self.assertIsNone(shared_budget.available_chunk_tokens(0, prefix_len=256))
+
+        # 8) Non-FULL head deferred after L3 poll still allows FULL+FULL mixing
+        # when the admitted FULL prefill fits with FULL decode.
+        nf_post_defer = Req(
+            rid="non-full-post-defer",
+            origin_input_text="",
+            origin_input_ids=array("q", list(range(1, 17))),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            return_hidden_states=False,
+        )
+        nf_post_defer.init_next_round_input = Mock()
+        full_behind = Req(
+            rid="full-behind-deferred",
+            origin_input_text="",
+            origin_input_ids=array("q", list(range(17, 33))),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            return_hidden_states=True,
+        )
+        full_behind.init_next_round_input = Mock()
+
+        class _PostDeferAdder:
+            def __init__(self, *args, **kwargs):
+                self.can_run_list = []
+                self.preempt_list = []
+                self.new_chunked_req = None
+
+            def budget_state(self):
+                return AddReqResult.CONTINUE
+
+            def add_one_req(self, req, **_kwargs):
+                self.can_run_list.append(req)
+                return AddReqResult.OTHER
+
+        dec_reqs = [
+            Req(
+                rid=f"mdec-{i}",
+                origin_input_text="",
+                origin_input_ids=array("q", [1, 2]),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=4),
+                return_hidden_states=True,
+            )
+            for i in range(2)
+        ]
+        m_rb = SimpleNamespace(
+            reqs=dec_reqs,
+            batch_is_full=False,
+            return_hidden_states_mode=CaptureHiddenMode.FULL,
+            return_logprob=False,
+            is_empty=lambda: False,
+            filter_batch=Mock(),
+            check_decode_mem=lambda: True,
+            prepare_for_decode=Mock(),
+        )
+        m_sched = Scheduler.__new__(Scheduler)
+        m_sched.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        m_sched.enable_hierarchical_cache = False
+        m_sched.enable_unified_cache_external_linker = False
+        m_sched.enable_waiting_queue_dfs_prefetch = False
+        m_sched.enable_priority_preemption = False
+        m_sched.is_hybrid_swa = True
+        m_sched.waiting_queue = [nf_post_defer, full_behind]
+        m_sched.chunked_req = None
+        m_sched.min_free_slots_delayer = None
+        m_sched.get_num_allocatable_reqs = lambda *a, **kw: 4
+        m_sched.policy = SimpleNamespace(calc_priority=lambda *a, **kw: None)
+        m_sched.chunked_prefill_size = 32
+        m_sched.dynamic_chunk_sizer = None
+        m_sched.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                attn_backend=SimpleNamespace(), prefill_aware_swa=False
+            )
+        )
+        m_sched.enable_lora = False
+        m_sched.is_mixed_chunk = True
+        m_sched.tree_cache = SimpleNamespace(
+            isolates_full_hidden_state_batches=lambda: True,
+            buffer_pipeline=None,
+            storage_prefetch_retries=None,
+            check_prefetch_progress=lambda h: True,
+            pop_prefetch_loaded_span=lambda handle: (0, 0),
+        )
+        m_sched.get_prefill_adder_class = lambda: _PostDeferAdder
+        m_sched.page_size = 16
+        m_sched.token_to_kv_pool_allocator = object()
+        m_sched.new_token_ratio_tracker = SimpleNamespace(current=0.7)
+        m_sched.max_prefill_tokens = 128
+        m_sched.priority_scheduling_preemption_threshold = 0
+        m_sched.max_prefill_bs = 4
+        m_sched.max_running_requests = 8
+        m_sched.dllm_config = None
+        m_sched.req_to_token_pool = SimpleNamespace()
+        m_sched.enable_hicache_storage = True
+        m_sched.enable_lmcache = False
+        m_sched._prefetch_after_device_hit_loss = lambda req: (
+            req.rid == "non-full-post-defer"
+        )
+        m_sched.truncation_align_size = None
+        m_sched.model_config = SimpleNamespace()
+        m_sched.enable_overlap = False
+        m_sched.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+        m_sched.hisparse_coordinator = None
+        m_sched.enable_priority_scheduling = False
+        m_sched.load_inquirer = SimpleNamespace(_get_num_pending_tokens=lambda **kw: 0)
+        m_sched.enable_kv_cache_events = False
+        m_sched.processed_tokens_counter = 0
+        m_sched.device = "cpu"
+        m_sched.disaggregation_mode = DisaggregationMode.NULL
+        m_sched._reqs_finishing_inflight = lambda _rb: []
+        mix_batch = SimpleNamespace(
+            reqs=[full_behind],
+            extend_num_tokens=16,
+            prepare_for_extend=Mock(),
+            return_logprob=False,
+            input_embeds=None,
+            return_hidden_states_mode=CaptureHiddenMode.FULL,
+            mix_with_running=Mock(),
+        )
+        with (
+            mock.patch(
+                "sglang.srt.managers.scheduler.get_memory",
+                return_value=SimpleNamespace(enable_flexkv=False),
+            ),
+            mock.patch(
+                "sglang.srt.managers.scheduler.get_schedule",
+                return_value=SimpleNamespace(prefill_max_requests=None),
+            ),
+            mock.patch(
+                "sglang.srt.managers.scheduler.ScheduleBatch.init_new",
+                return_value=mix_batch,
+            ),
+            mock.patch(
+                "sglang.srt.managers.scheduler.PrefillStats.from_adder",
+                return_value=None,
+            ),
+        ):
+            Scheduler._get_new_batch_prefill_raw(m_sched, None, m_rb)
+        mix_batch.mix_with_running.assert_called_once_with(m_rb)
 
 
 if __name__ == "__main__":

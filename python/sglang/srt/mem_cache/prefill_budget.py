@@ -444,7 +444,10 @@ class SharedSWAPrefillBudget(SWAPrefillBudget):
     def has_capacity(self) -> bool:
         return self._fits(0, 0)
 
-    def available_chunk_tokens(self, chunk_limit: int) -> int | None:
+    def available_chunk_tokens(
+        self, chunk_limit: int, *, prefix_len: int = 0
+    ) -> int | None:
+        del prefix_len
         return chunk_limit if chunk_limit > 0 else None
 
     def fit_chunk(
