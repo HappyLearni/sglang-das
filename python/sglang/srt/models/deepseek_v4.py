@@ -3239,6 +3239,17 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             self.hc_attn_scale,
             self.hc_ffn_scale,
         ) = make_hc_mixing_params(hc_mult, config.hidden_size)
+        if _is_hcu:
+            from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+                refresh_hc_fn_bf16x2_cache,
+            )
+
+            def _hc_fn_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor):
+                default_weight_loader(param, loaded_weight)
+                refresh_hc_fn_bf16x2_cache(param)
+
+            self.hc_attn_fn.weight_loader = _hc_fn_weight_loader
+            self.hc_ffn_fn.weight_loader = _hc_fn_weight_loader
         self.rms_norm_eps = config.rms_norm_eps
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.use_fused_mhc_post_pre = (
@@ -3391,6 +3402,13 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             if _is_hcu:
                 packed = mhc.prepare_hcu_mega_weight(self.ffn_hc, previous_packed)
                 self.ffn_hc = self.ffn_hc._replace(fn_packed=packed)
+        if _is_hcu:
+            from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+                refresh_hc_fn_bf16x2_cache,
+            )
+
+            refresh_hc_fn_bf16x2_cache(self.hc_attn_fn)
+            refresh_hc_fn_bf16x2_cache(self.hc_ffn_fn)
         # The fuse gates and boundaries snapshot load-time facts; weight updates
         # re-run this, so drop them and re-resolve on the next forward.
         self.__dict__.pop("_can_fuse_attn_mhc", None)
@@ -5716,6 +5734,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                 module.setup_mega_attention()
 
         if is_nextn:
+            if _is_hcu:
+                decoder = getattr(self.model, "decoder", None)
+                if decoder is not None and hasattr(decoder, "hc_attn_fn"):
+                    from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+                        refresh_hc_fn_bf16x2_cache,
+                    )
+
+                    refresh_hc_fn_bf16x2_cache(decoder.hc_attn_fn)
+                    refresh_hc_fn_bf16x2_cache(decoder.hc_ffn_fn)
             return
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
