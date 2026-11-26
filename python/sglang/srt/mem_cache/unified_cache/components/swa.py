@@ -362,13 +362,17 @@ class SWAComponent(TreeComponent):
         gates_prefix_match = self.gates_prefix_match
 
         def validator(node: UnifiedTreeNode) -> bool:
+            if not gates_prefix_match:
+                return (
+                    not node.evicted
+                    if match_device_only
+                    else (node.backuped or not node.evicted)
+                )
             cd = node.component_data[ct]
             # HiCache: a host-only tombstone is a valid match boundary too
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
-                if not gates_prefix_match and (node.backuped or not node.evicted):
-                    return True
                 return False
             state["len"] += len(node.key)
             return state["len"] >= sliding_window_size

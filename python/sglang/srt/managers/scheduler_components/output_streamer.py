@@ -179,6 +179,19 @@ class SchedulerOutputStreamer:
             rust_server_mode=self.rust_server is not None,
             current_weight_version=get_serving().weight_version,
         )
+        prev_stream_state = [
+            (
+                req,
+                req.finished_output,
+                req.finished_len,
+                req.send_token_offset,
+                req.send_decode_id_offset,
+                req.input_logprob_sent,
+                req.send_output_token_logprobs_offset,
+            )
+            for req in reqs
+            if req is not skip_req and not (req.finished() and req.finished_output)
+        ]
         for req in reqs:
             if req is skip_req:
                 continue
@@ -213,10 +226,32 @@ class SchedulerOutputStreamer:
             is_idle_batch=is_idle_batch,
         )
         if payload is not None:
-            if self.rust_server is not None:
-                self.rust_server.push_generation(payload)
-            else:
-                self.send_to_detokenizer.send_output(payload)
+            try:
+                if self.rust_server is not None:
+                    self.rust_server.push_generation(payload)
+                else:
+                    self.send_to_detokenizer.send_output(payload)
+            except Exception:
+                # Restore stream bookkeeping so a retry after a transient IPC
+                # error neither drops the final response nor advances offsets.
+                for (
+                    req,
+                    prev_finished_output,
+                    prev_finished_len,
+                    prev_send_token_offset,
+                    prev_send_decode_id_offset,
+                    prev_input_logprob_sent,
+                    prev_send_output_token_logprobs_offset,
+                ) in prev_stream_state:
+                    req.finished_output = prev_finished_output
+                    req.finished_len = prev_finished_len
+                    req.send_token_offset = prev_send_token_offset
+                    req.send_decode_id_offset = prev_send_decode_id_offset
+                    req.input_logprob_sent = prev_input_logprob_sent
+                    req.send_output_token_logprobs_offset = (
+                        prev_send_output_token_logprobs_offset
+                    )
+                raise
 
     def build_additional_customized_info(self, reqs: List[Req]) -> dict[str, list]:
         """Return fields aligned with the emitted requests in ``reqs``.

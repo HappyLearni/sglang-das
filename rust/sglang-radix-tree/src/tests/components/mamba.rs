@@ -78,6 +78,7 @@ fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
     MatchPrefixParams {
         key,
         namespace: Default::default(),
+        return_full_match: false,
     }
 }
 

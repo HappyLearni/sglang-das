@@ -372,11 +372,18 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         let mut contiguous_len = usize::MAX;
         Box::new(move |tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_| {
             let node = tree_core.arena.node(node_id);
+            if swa_req_ring {
+                return if match_device_only {
+                    !node.evicted()
+                } else {
+                    node.backuped() || !node.evicted()
+                };
+            }
             // HiCache: a host-only tombstone is a valid match boundary too
             // — load_back will restore SWA from host before use.
             if !node.has_device_value(SWA) && (match_device_only || !node.has_host_value(SWA)) {
                 contiguous_len = 0;
-                return swa_req_ring && (node.backuped() || !node.evicted());
+                return false;
             }
             contiguous_len = contiguous_len.saturating_add(node.key.atom_len());
             contiguous_len >= sliding_window_size

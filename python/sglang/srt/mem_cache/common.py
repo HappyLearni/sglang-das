@@ -204,16 +204,69 @@ def free_kv_row_segments(
         allocator.free_segments(swa_alive)
 
 
+def _swa_prefix_match_limit(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    input_len: int,
+    *,
+    return_full_match: bool = False,
+) -> Optional[int]:
+    limit_fn = getattr(tree_cache, "swa_prefix_match_limit", None)
+    if limit_fn is not None:
+        limit = limit_fn(req, input_len=input_len, return_full_match=return_full_match)
+        return limit if isinstance(limit, int) and not isinstance(limit, bool) else None
+    reprefill_tail = tree_cache.swa_reprefill_tail_tokens(req)
+    if (
+        not isinstance(reprefill_tail, int)
+        or isinstance(reprefill_tail, bool)
+        or reprefill_tail <= 0
+    ):
+        return None
+    return max(0, input_len - reprefill_tail)
+
+
+def effective_max_prefix_len(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    input_len: int,
+    *,
+    max_prefix_len: Optional[int] = None,
+    return_full_match: bool = False,
+) -> int:
+    """Maximum prefix length ``req`` may reuse from ``tree_cache`` or storage."""
+    if getattr(req, "positional_embed_overrides", None) is not None:
+        return 0
+    limit = req._compute_max_prefix_len(input_len)
+    if max_prefix_len is not None:
+        limit = min(limit, max_prefix_len)
+    swa_limit = _swa_prefix_match_limit(
+        tree_cache, req, input_len, return_full_match=return_full_match
+    )
+    if isinstance(swa_limit, int) and not isinstance(swa_limit, bool):
+        limit = min(limit, swa_limit)
+    return max(limit, 0)
+
+
 def _req_radix_key(
     tree_cache: BasePrefixCache,
     req: Req,
     token_ids: array[int],
     max_prefix_len: Optional[int] = None,
+    *,
+    return_full_match: bool = False,
 ) -> RadixKey:
+    if getattr(req, "positional_embed_overrides", None) is not None:
+        return RadixKey(
+            token_ids=token_ids,
+            extra_key=req.extra_key,
+            limit=0,
+            cache_salt=req.cache_salt,
+        )
     # A reused prefix may carry stale or unwritten SWA (the unified_kv ring, decoder
     # bounded replay); cap the match so the window is re-prefilled.
-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens(req)
-    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    key_limit = _swa_prefix_match_limit(
+        tree_cache, req, len(token_ids), return_full_match=return_full_match
+    )
     if max_prefix_len is not None:
         key_limit = (
             max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
@@ -247,9 +300,14 @@ def match_kv_cache(
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
-            key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
-            return_full_match=return_full_match
-            or bool(tree_cache.swa_reprefill_tail_tokens()),
+            key=_req_radix_key(
+                tree_cache,
+                req,
+                token_ids,
+                max_prefix_len,
+                return_full_match=return_full_match,
+            ),
+            return_full_match=return_full_match,
             cow_mamba=cow_mamba,
             req=req,
         )
@@ -274,7 +332,13 @@ def match_kv_cache(
         match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
     )
-    max_len = req._compute_max_prefix_len(len(token_ids))
+    max_len = effective_max_prefix_len(
+        req,
+        tree_cache,
+        len(token_ids),
+        max_prefix_len=max_prefix_len,
+        return_full_match=return_full_match,
+    )
     req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
     # A probe match keeps what it did not report; a new round resets both.

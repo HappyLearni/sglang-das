@@ -311,10 +311,14 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
+    effective_max_prefix_len,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -3750,6 +3754,13 @@ class Scheduler(
         else:
             req.logprob_start_len = recv_req.logprob_start_len
 
+        if req.logprob_start_len < -1:
+            error_msg = f"{req.logprob_start_len=} is invalid. Please use a logprob_start_len >= -1."
+            req.logprob_start_len = -1
+            req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+
         if req.logprob_start_len > len(req.origin_input_ids):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
             req.logprob_start_len = -1
@@ -4072,9 +4083,16 @@ class Scheduler(
                     and tree_cache.get_last_hash_value(last_host_node) is not None
                 )
             ):
-                match_end = req._compute_max_prefix_len(
-                    len(req.full_untruncated_fill_ids)
+                match_end = effective_max_prefix_len(
+                    req, tree_cache, len(req.full_untruncated_fill_ids)
                 )
+                # LMCache reconciles unequal TP-rank local L1 hits via a MIN
+                # all-reduce in check_prefetch_progress; every rank must still
+                # create the flow whenever the rank-identical match_end > 0.
+                if match_end <= 0 or (
+                    not self.enable_lmcache and match_end <= matched_len
+                ):
+                    return None
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
                 prefix_keys = (
                     tree_cache.get_prefix_hash_values(last_host_node)
@@ -4087,10 +4105,16 @@ class Scheduler(
                     new_input_tokens,
                     tree_cache.get_last_hash_value(last_host_node),
                     prefix_keys,
-                    matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
+                    matched_prefix_tokens=req.full_untruncated_fill_ids[
+                        : min(matched_len, match_end)
+                    ],
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
-                    storage_hit_end=storage_hit_end,
+                    storage_hit_end=(
+                        min(storage_hit_end, match_end)
+                        if storage_hit_end is not None
+                        else None
+                    ),
                 )
 
     def _process_storage_prefetch_retries(self):
@@ -4522,8 +4546,55 @@ class Scheduler(
             req.external_kv_abort_response_via_chunked = True
             pending[req.rid] = req
         # A later chunk's abort must not replace the earlier response retry owner.
-        for aborted_req in tuple(pending.values()):
-            self._process_external_kv_chunked_abort(aborted_req)
+        pending_reqs = tuple(pending.values())
+        if pending_reqs:
+            all_reduce_fn = getattr(self, "_all_reduce_drain_flags", None)
+            local_drained = [
+                int(
+                    self.prefill_abort_forward_drained(r)
+                    and self.prefill_abort_sender_terminal(r)
+                )
+                for r in pending_reqs
+            ]
+            agreed_drained = (
+                all_reduce_fn(local_drained)
+                if all_reduce_fn is not None
+                else local_drained
+            )
+            local_done = [
+                int(
+                    self._process_external_kv_chunked_abort(
+                        aborted_req, drained=bool(agreed_drained[idx])
+                    )
+                )
+                for idx, aborted_req in enumerate(pending_reqs)
+            ]
+            local_res_ok = [
+                int(
+                    not agreed_drained[idx]
+                    or getattr(aborted_req, "external_kv_cache_released", False)
+                )
+                for idx, aborted_req in enumerate(pending_reqs)
+            ]
+            all_done = (
+                all_reduce_fn(local_done) if all_reduce_fn is not None else local_done
+            )
+            all_res_ok = (
+                all_reduce_fn(local_res_ok)
+                if all_reduce_fn is not None
+                else local_res_ok
+            )
+            for idx, aborted_req in enumerate(pending_reqs):
+                if all_done[idx]:
+                    aborted_req.pd_abort_resource_cleanup_pending = False
+                    pending.pop(aborted_req.rid, None)
+                    if self._pending_chunked_abort_req is aborted_req:
+                        self._pending_chunked_abort_req = None
+                    logger.debug(f"Abort chunked prefill request. {aborted_req.rid=}")
+                else:
+                    aborted_req.pd_abort_resource_cleanup_pending = not bool(
+                        all_res_ok[idx]
+                    )
         req = self._pending_chunked_abort_req
         if req is None or req.external_kv_abort_requested or req.rid in pending:
             return
@@ -4543,33 +4614,87 @@ class Scheduler(
         prepare_abort(req, reason.message, reason.status_code)
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.to_finish = None
+        # A client abort leaves the message to the tokenizer.
+        finished_reason = req.discard_output_reason and reason.to_json()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.clear_pending_chunk_send(req)
-            req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
+            sender = req.disagg_kv_sender
+            if sender is not None:
+                try:
+                    sender.abort()
+                    req.external_kv_sender_abort_requested = True
+                except Exception:
+                    logger.exception(
+                        "Failed to notify KV sender of abort for %s", req.rid
+                    )
             req.pending_bootstrap = False
+            has_submitted_fn = getattr(self, "_has_submitted_pd_transfer", None)
+            has_submitted = (
+                has_submitted_fn(req)
+                if has_submitted_fn is not None
+                else (
+                    sender is not None
+                    and (
+                        getattr(req, "pd_early_send_attempted", False)
+                        or (getattr(req, "start_send_idx", 0) or 0) > 0
+                        or req.rid
+                        in getattr(self, "disagg_prefill_pending_chunk_rids", ())
+                        or not self.prefill_abort_forward_drained(req)
+                    )
+                )
+            )
+            if has_submitted:
+                # Rank-identical handoff to disagg_prefill_inflight_queue so all
+                # TP/CP ranks keep KV/metadata, the unified-memory move gate,
+                # and is_fully_idle() closed until every rank drains together.
+                req.pd_client_chunked_abort_pending = True
+                req.pd_client_chunked_abort_msg = _make_abort_req(
+                    req, finished_reason=finished_reason
+                )
+                self.chunked_req = None
+                self._pending_chunked_abort_req = None
+                if req not in self.disagg_prefill_inflight_queue:
+                    self.disagg_prefill_inflight_queue.append(req)
+                logger.debug(
+                    f"Deferring chunked prefill abort to collective PD drain. {req.rid=}"
+                )
+                return
+            self.clear_pending_chunk_send(req)
+            maybe_release_metadata_buffer(
+                req,
+                self.req_to_metadata_buffer_idx_allocator,
+                getattr(
+                    getattr(self, "disagg_metadata_buffers", None),
+                    "pd_hidden_pool",
+                    None,
+                ),
+            )
         self._release_aborted_request(req)
         release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        # A client abort leaves the message to the tokenizer.
-        finished_reason = req.discard_output_reason and reason.to_json()
         self.ipc_channels.send_to_tokenizer.send_output(
             _make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
-    def _process_external_kv_chunked_abort(self, req) -> None:
+    def _process_external_kv_chunked_abort(
+        self, req, *, drained: Optional[bool] = None
+    ) -> bool:
         if self.chunked_req is req:
             self.chunked_req = None
         req.external_kv_abort_response_via_chunked = True
-        sender_terminal = self.prefill_abort_sender_terminal(req)
+        if req.external_kv_cleanup_done and req.external_kv_response_sent:
+            return True
+        if drained is None:
+            forward_drained = self.prefill_abort_forward_drained(req)
+            sender_terminal = self.prefill_abort_sender_terminal(req)
+        else:
+            forward_drained = drained
+            sender_terminal = drained
         cleanup_done = self.abort_external_kv_request(
             req,
-            forward_drained=self.prefill_abort_forward_drained(req),
+            forward_drained=forward_drained,
             sender_terminal=sender_terminal,
             abort_message=getattr(
                 req.to_finish or req.finished_reason,
@@ -4580,7 +4705,7 @@ class Scheduler(
             emit_response=False,
         )
         if not cleanup_done:
-            return
+            return False
         if not req.external_kv_response_sent:
             try:
                 self.ipc_channels.send_to_tokenizer.send_output(
@@ -4594,13 +4719,9 @@ class Scheduler(
                 logger.exception(
                     "Chunked abort response failed for %s; will retry", req.rid
                 )
-                return
+                return False
             req.external_kv_response_sent = True
-        self._external_kv_chunked_abort_reqs.pop(req.rid, None)
-        if self._pending_chunked_abort_req is req:
-            self._pending_chunked_abort_req = None
-        logger.debug(f"Abort chunked prefill request. {req.rid=}")
-        return
+        return True
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -4845,6 +4966,30 @@ class Scheduler(
 
         return res
 
+    def _can_share_bounded_replay_hidden_mode(
+        self, req: Req, admitted_reqs: List[Req], running_batch: ScheduleBatch
+    ) -> bool:
+        """Under decoder SWA bounded replay with paged SWA (outside DSpark), a
+        batch-wide CaptureHiddenMode.FULL marks every request in the forward
+        batch whole_extend=True, which would make a non-FULL peer with a cached
+        prefix read unwritten late-layer SWA rows. Keep FULL prefill requests
+        isolated from non-FULL peers; mixed-chunk separation from a FULL running
+        decode batch is handled by the mixing predicate so non-FULL prefills
+        never starve."""
+        del running_batch
+        isolate_fn = getattr(
+            self.tree_cache, "isolates_full_hidden_state_batches", None
+        )
+        if isolate_fn is None or not isolate_fn():
+            return True
+        req_full = req.return_hidden_states_mode == CaptureHiddenMode.FULL
+        if admitted_reqs and (
+            req_full
+            != (admitted_reqs[0].return_hidden_states_mode == CaptureHiddenMode.FULL)
+        ):
+            return False
+        return True
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -4911,6 +5056,19 @@ class Scheduler(
         ) and self.chunked_req is None:
             return None, running_batch
 
+        # If any TP/CP rank failed mid-cleanup while another freed its row/KV,
+        # pause new waiting-queue admission on every rank until the retry
+        # completes so local free-row/KV counts cannot split the next batch.
+        abort_cleanup_pending = any(
+            getattr(r, "pd_abort_resource_cleanup_pending", False)
+            for r in getattr(self, "disagg_prefill_inflight_queue", ())
+        ) or any(
+            getattr(r, "pd_abort_resource_cleanup_pending", False)
+            for r in getattr(self, "_external_kv_chunked_abort_reqs", {}).values()
+        )
+        if abort_cleanup_pending and self.chunked_req is None:
+            return None, running_batch
+
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
@@ -4965,6 +5123,77 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        if self.enable_lora:
+            running_loras = {
+                req.lora_id for req in running_batch.reqs if not req.finished()
+            }
+            if self.lora_drainer:
+                self.lora_drainer.update_draining_state(
+                    self.waiting_queue,
+                    running_batch.reqs,
+                )
+
+        prefetched_ready_by_rid: Dict[str, bool] = {}
+        isolates_full_decode = (
+            self.is_mixed_chunk
+            and not running_batch.is_empty()
+            and getattr(self.tree_cache, "isolates_full_hidden_state_batches", None)
+            is not None
+            and self.tree_cache.isolates_full_hidden_state_batches()
+            and running_batch.return_hidden_states_mode == CaptureHiddenMode.FULL
+        )
+        first_prefill_candidate = self.chunked_req
+        if isolates_full_decode and first_prefill_candidate is None:
+            for candidate in self.waiting_queue:
+                if self.enable_lora and not self.can_schedule_lora_req(
+                    candidate, running_loras
+                ):
+                    continue
+                candidate_beam_width = (
+                    candidate.beam_group.beam_width
+                    if candidate.beam_group is not None
+                    else None
+                )
+                if (
+                    self.get_num_allocatable_reqs(
+                        running_bs,
+                        candidate_beam_width,
+                        running_batch=running_batch,
+                        num_held_rows=0,
+                    )
+                    <= 0
+                    and not self.enable_priority_preemption
+                ):
+                    break
+                if (
+                    self.enable_waiting_queue_dfs_prefetch
+                    and waiting_queue_prefetch_states.get(candidate.rid, "not_tracked")
+                    == "pending"
+                ):
+                    continue
+                if not running_batch.return_logprob and (
+                    self.enable_hicache_storage or self.enable_lmcache
+                ):
+                    prefetch_done = self.tree_cache.check_prefetch_progress(
+                        candidate.cache_request_handle
+                    )
+                    candidate.time_stats.observe_storage_prefetch_ready(prefetch_done)
+                    prefetched_ready_by_rid[candidate.rid] = prefetch_done
+                    if not prefetch_done:
+                        continue
+                first_prefill_candidate = candidate
+                break
+
+        non_mixing_full_decode = (
+            isolates_full_decode
+            and first_prefill_candidate is not None
+            and (
+                first_prefill_candidate.return_hidden_states_mode
+                != CaptureHiddenMode.FULL
+                or first_prefill_candidate.return_logprob
+                or running_batch.return_logprob
+            )
+        )
         adder = self.get_prefill_adder_class()(
             self.page_size,
             self.tree_cache,
@@ -4973,7 +5202,7 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            running_bs if (self.is_mixed_chunk and not non_mixing_full_decode) else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
@@ -4995,24 +5224,15 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            running_loras = {
-                req.lora_id for req in running_batch.reqs if not req.finished()
-            }
             # Account for LoRAs that are already loaded in the adder, such as chunked requests
             running_loras.update(req.lora_id for req in adder.can_run_list)
-
-            if self.lora_drainer:
-                self.lora_drainer.update_draining_state(
-                    self.waiting_queue,
-                    running_batch.reqs,
-                )
 
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in () if abort_cleanup_pending else self.waiting_queue:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if adder.budget_state() == AddReqResult.OTHER:
@@ -5026,6 +5246,11 @@ class Scheduler(
             if adder.can_run_list and (
                 (req.token_indices_to_pool is not None)
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
+            ):
+                continue
+
+            if not self._can_share_bounded_replay_hidden_mode(
+                req, adder.can_run_list, running_batch
             ):
                 continue
 
@@ -5058,10 +5283,13 @@ class Scheduler(
                 abandoned_prefetch = prefetch_state == "terminal"
 
             if self.enable_hicache_storage or self.enable_lmcache:
-                prefetch_done = self.tree_cache.check_prefetch_progress(
-                    req.cache_request_handle
-                )
-                req.time_stats.observe_storage_prefetch_ready(prefetch_done)
+                if req.rid in prefetched_ready_by_rid:
+                    prefetch_done = prefetched_ready_by_rid.pop(req.rid)
+                else:
+                    prefetch_done = self.tree_cache.check_prefetch_progress(
+                        req.cache_request_handle
+                    )
+                    req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
@@ -5151,8 +5379,13 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
+        launched_chunked_req = (
+            self.chunked_req
+            if (self.chunked_req is not None and self.chunked_req in can_run_set)
+            else None
+        )
+        if launched_chunked_req is not None:
+            launched_chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -5165,11 +5398,11 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            chunked_req=self.chunked_req,
+            chunked_req=launched_chunked_req,
         )
 
         new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+            launched_chunked_req is None or len(can_run_list) != 1
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
 
@@ -5206,6 +5439,30 @@ class Scheduler(
             and new_batch.input_embeds is None
             # Beam member rows are not supported inside a mixed extend batch.
             and all(r.beam_group is None for r in running_batch.reqs)
+            # Do not promote a non-FULL prefill batch to FULL via a FULL decode
+            # batch under paged-SWA bounded replay (outside DSpark), nor exceed
+            # chunked_prefill_size when running_bs was withheld from the prefill
+            # chunk budget above. If a non-FULL head was deferred after look-ahead
+            # and a FULL prefill behind it fits with the FULL decode rows, allow
+            # valid FULL+FULL mixing.
+            and not (
+                non_mixing_full_decode
+                and (
+                    new_batch.return_hidden_states_mode != CaptureHiddenMode.FULL
+                    or (
+                        chunked_prefill_size is not None
+                        and new_batch.extend_num_tokens + len(running_batch.reqs)
+                        > chunked_prefill_size
+                    )
+                )
+            )
+            and not (
+                getattr(self.tree_cache, "isolates_full_hidden_state_batches", None)
+                is not None
+                and self.tree_cache.isolates_full_hidden_state_batches()
+                and running_batch.return_hidden_states_mode == CaptureHiddenMode.FULL
+                and new_batch.return_hidden_states_mode != CaptureHiddenMode.FULL
+            )
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             finishing_reqs = self._reqs_finishing_inflight(running_batch)
@@ -6292,6 +6549,7 @@ class Scheduler(
         idle = (
             self.running_batch.is_empty()
             and self.chunked_req is None
+            and not getattr(self, "_external_kv_chunked_abort_reqs", None)
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)

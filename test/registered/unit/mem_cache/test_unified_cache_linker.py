@@ -1325,6 +1325,21 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
         evicted=False,
     )
     assert component.create_match_validator(match_device_only=True)(node) is unified_kv
+    evicted_backed = SimpleNamespace(
+        component_data={
+            ComponentType.SWA: SimpleNamespace(value=None, host_value=None)
+        },
+        backuped=True,
+        evicted=True,
+    )
+    assert (
+        component.create_match_validator(match_device_only=True)(evicted_backed)
+        is False
+    )
+    assert (
+        component.create_match_validator(match_device_only=False)(evicted_backed)
+        is unified_kv
+    )
 
 
 def test_cache_without_swa_needs_no_reprefill():

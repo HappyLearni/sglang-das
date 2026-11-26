@@ -161,6 +161,8 @@ pub struct MatchPrefixParams<'k, K: ChildKeyType> {
     pub key: &'k K,
     /// Namespace of the query; picks the matching subtree root.
     pub namespace: KeyNamespaceRef<'k>,
+    /// Match using only the base FULL component validator (ignoring SWA/Mamba).
+    pub return_full_match: bool,
 }
 
 /// Params for an insert; the key is borrowed from the caller.
@@ -1269,7 +1271,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self.match_prefix_helper_(root_id, params.namespace, key, aligned_key_len);
+        ) = self.match_prefix_helper_(
+            root_id,
+            params.namespace,
+            key,
+            aligned_key_len,
+            params.return_full_match,
+        );
         self.match_post_processor_(
             params,
             root_id,
@@ -1328,6 +1336,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         namespace: KeyNamespaceRef<'_>,
         key: &K,
         aligned_key_len: usize,
+        return_full_match: bool,
     ) -> (
         Vec<Tensor>,
         NodeIdx_,
@@ -1358,6 +1367,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         };
         for i in 0..self.components.len() {
             let component = Arc::clone(&self.components[i]);
+            if return_full_match && component.component_type() != BASE_COMPONENT_TYPE {
+                continue;
+            }
             if separate_device_match {
                 validators.push(
                     component.create_match_validator(self, /* match_device_only = */ false),

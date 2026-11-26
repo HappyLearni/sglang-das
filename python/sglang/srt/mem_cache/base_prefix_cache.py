@@ -708,6 +708,19 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # Caches whose matched SWA is not reusable as is override this.
         return 0
 
+    def swa_prefix_match_limit(
+        self,
+        req=None,
+        *,
+        input_len: int,
+        return_full_match: bool = False,
+    ) -> Optional[int]:
+        tail = self.swa_reprefill_tail_tokens(req)
+        return max(0, input_len - tail) if tail else None
+
+    def isolates_full_hidden_state_batches(self) -> bool:
+        return False
+
     def supports_mamba(self) -> bool:
         return False
 
