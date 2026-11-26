@@ -1,6 +1,7 @@
 """Legacy prefill CP helpers retained for HIP, NPU, and MUSA callers."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 from itertools import accumulate
 from typing import List
 
@@ -329,18 +330,62 @@ def _use_inplace_cp_output(tensor):
     )
 
 
-def _interleave_cp_output(output_tensor, cp_size):
-    """Reorder an exclusively owned, completed gather without a second buffer.
+@lru_cache(maxsize=64)
+def _cp_interleave_has_long_cycle(rows, cp_size, min_cycle_rows):
+    # The interior row permutation multiplies by cp_size modulo rows - 1.
+    # All interior row periods divide the period of row 1.
+    row = 1
+    for _ in range(1, min_cycle_rows):
+        row = row * cp_size % (rows - 1)
+        if row == 1:
+            return False
+    return True
 
-    The optional LightOp kernel rotates disjoint row cycles in place. The
-    communication must finish before mutation; no consumer may retain the
+
+def _interleave_cp_output_tiled_(output_tensor, cp_size):
+    rows = output_tensor.shape[0]
+    local_rows = rows // cp_size
+    flat_output = output_tensor.view(rows, 5120)
+    tile_columns = 256
+    scratch = output_tensor.new_empty((rows, tile_columns))
+    ordered_tile = scratch.view(local_rows, cp_size, tile_columns)
+    # Each column tile is independent. Stage all of its rows before writing back.
+    for start in range(0, flat_output.shape[1], tile_columns):
+        columns = flat_output[:, start : start + tile_columns]
+        rank_major = columns.view(cp_size, local_rows, tile_columns)
+        ordered_tile.copy_(rank_major.transpose(0, 1))
+        columns.copy_(scratch)
+    return output_tensor
+
+
+def _interleave_cp_output(output_tensor, cp_size):
+    """Reorder an exclusively owned, completed gather into token order.
+
+    The communication must finish before mutation; no consumer may retain the
     original rank-major layout. Only the ordinary equal-share interleave path
     uses this helper. Bounded-replay gather_index retains its compact selection.
     """
     if _use_inplace_cp_output(output_tensor):
-        from lightop.attention.cp_output import interleave_cp_output_
+        rows = output_tensor.shape[0]
+        row_width = output_tensor.numel() // max(rows, 1)
+        use_copy = (
+            cp_size == 8
+            and rows > cp_size
+            and rows % cp_size == 0
+            and row_width in (512, 5120)
+            and output_tensor.element_size() == 2
+            and output_tensor.is_contiguous()
+            and not output_tensor.requires_grad
+            and _cp_interleave_has_long_cycle(
+                rows, cp_size, 512 if row_width == 5120 else 256
+            )
+        )
+        if not use_copy:
+            from lightop.attention.cp_output import interleave_cp_output_
 
-        return interleave_cp_output_(output_tensor, cp_size)
+            return interleave_cp_output_(output_tensor, cp_size)
+        if row_width == 5120:
+            return _interleave_cp_output_tiled_(output_tensor, cp_size)
     out_shape = output_tensor.shape
     return (
         output_tensor.view(cp_size, -1, *out_shape[1:])
